@@ -219,7 +219,9 @@ class Store:
         self.conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=30000")
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # Switching a fresh DB to WAL can fail with "locked" when several processes open
+        # it at once (busy_timeout is not always honored for this pragma), so retry it.
+        self._retry(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self._retry(lambda: self.conn.executescript(SCHEMA))
 
