@@ -218,8 +218,9 @@ class Streamer:
     stops shipping but keeps echoing.
     """
 
-    def __init__(self, be, post_id: str | None, echo: bool):
+    def __init__(self, be, post_id: str | None, echo: bool, expect_kind: str | None = None):
         self.be = be
+        self.expect_kind = expect_kind
         self.post_id = post_id
         self.echo = echo
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -284,7 +285,7 @@ class Streamer:
     def _send(self, text: str, **kw) -> bool:
         """One append; returns True on success. Transient failures give the text back."""
         try:
-            self.be.append(self.post_id, text=text or None, **kw)
+            self.be.append(self.post_id, text=text or None, expect_kind=self.expect_kind, **kw)
             self.warned = False
             return True
         except BoardError as e:
@@ -450,7 +451,7 @@ def log_cmd(
         create_error = e
         warn(f"{getattr(e, 'message', e)}; {'running the command' if cmd else 'passing output through'} without posting")
 
-    streamer = Streamer(be, post_id, echo=not quiet)
+    streamer = Streamer(be, post_id, echo=not quiet, expect_kind="log")
     streamer.start()
 
     if not cmd:  # pipe mode
@@ -508,6 +509,8 @@ def append_cmd(
     if not post_id:
         raise InputError("give the post ID: board append ID TEXT (or -s STATUS / -t TITLE)")
     s = status_name(status)
+    if text == "":
+        text = None
     if text is None and s is None and title is None:
         raise InputError("give TEXT to add, or -s STATUS / -t TITLE to change")
     if text == "-":
@@ -517,7 +520,7 @@ def append_cmd(
         post = be.get_post(post_id)
         if post["kind"] not in ("log", "text", "markdown"):
             raise BoardError("can only append to log, text or markdown posts; use --key to replace", 409)
-        streamer = Streamer(be, post_id, echo=not quiet)
+        streamer = Streamer(be, post_id, echo=not quiet, expect_kind=post["kind"])
         streamer.start()
         pump(sys.stdin.fileno(), streamer)
         final = {k: v for k, v in (("status", s), ("title", title)) if v is not None}

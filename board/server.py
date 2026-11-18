@@ -311,6 +311,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             done=bool(d.get("done", False)),
             exit_code=exit_code,
             newline=bool(d.get("newline", False)),
+            expect_kind=opt_str(d, "expect_kind"),
         )
         hub.nudge.set()
         return res

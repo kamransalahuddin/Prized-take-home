@@ -535,3 +535,23 @@ def test_serve_port_in_use_is_clean_error(board):
     assert r.stdout == ""
     r = board("serve", "--port", "99999")
     assert r.returncode == 2 and "Traceback" not in r.stderr
+
+
+def test_log_stops_when_post_replaced_by_key(board, board_env, store):
+    import time as _t
+    p = subprocess.Popen([sys.executable, "-m", "board.cli", "log", "-a", "lead", "-k", "job", "--", "sh", "-c",
+                          "for i in 1 2 3 4 5 6; do echo L$i; sleep 0.2; done; exit 3"],
+                         env=board_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pid = p.stdout.readline().strip()
+    _t.sleep(0.6)
+    assert board("post", "-a", "lead", "-k", "job", "replaced").stdout.strip() == pid
+    p.communicate(timeout=10)
+    assert p.returncode == 3  # child's code still passes through
+    post = store.get_post(pid)
+    assert post["kind"] == "text" and post["payload"] == {"text": "replaced"}
+
+
+def test_empty_append_is_usage_error(board):
+    pid = board("post", "-a", "lead", "x").stdout.strip()
+    r = board("append", pid, "")
+    assert r.returncode == 2

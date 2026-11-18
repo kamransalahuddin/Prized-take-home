@@ -400,6 +400,7 @@ class Store:
         done: bool = False,
         exit_code: int | None = None,
         newline: bool = False,
+        expect_kind: str | None = None,
     ) -> dict:
         """Append text to a log/text/markdown post and/or change status/title/live.
 
@@ -408,6 +409,8 @@ class Store:
         exit_code set → payload.exit_code, status ok/error unless status given; done → live false.
         Emits an 'append' event when text was added, else a 'post' event (full post).
         Returns a light result {id, seq, status, title, live, updated_at, size}."""
+        if text == "":
+            text = None
         if text is None and status is None and title is None and not done and exit_code is None:
             raise BoardError("nothing to append: give text, a status or a title")
         if status is not None:
@@ -420,6 +423,10 @@ class Store:
             if not r:
                 raise BoardError(f"no post {post_id}", 404)
             kind = r["kind"]
+            if expect_kind and kind != expect_kind:
+                raise BoardError(f"post {post_id} is now a {kind} post (replaced with --key); not appending", 409)
+            if exit_code is not None and kind != "log":
+                raise BoardError("exit_code only applies to log posts", 409)
             payload = json.loads(r["payload"])
             new_status = status or r["status"]
             if exit_code is not None:

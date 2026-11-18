@@ -44,6 +44,7 @@ LOGS (live, growing output)
       or error from the exit code and exits with that code.
   make build 2>&1 | board log -a lead -t "build"
       Streams stdin live. Stays info when done: set ok/error yourself.
+      Programs may buffer piped output; prefer -- CMD (or python -u).
   Both print the ID first and copy the output to stderr, so you still
   see it. For long commands, run them in the background.
   board append ID TEXT     add text to a log, text or Markdown post
