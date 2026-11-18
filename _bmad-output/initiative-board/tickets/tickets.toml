@@ -1,0 +1,6 @@
+[[epic]]
+id = 1
+slug = "epic-board"
+title = "board CLI, server and live page"
+description = "Agents post every content kind with the board CLI and a person sees it live on the page."
+covers = ["R1", "R2", "R3", "R4", "R5", "R6", "R7"]
