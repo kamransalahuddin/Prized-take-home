@@ -20,6 +20,8 @@ POST
   board post -a NAME --image FILE    PNG, JPEG, GIF, WebP or SVG
 
   VALUE is literal text. "-" reads stdin. "@path" reads a file.
+  Text may start with "-" ("-3 tests failed"); text starting with "@" is
+  posted as-is unless it names a file, so pipe it in with - if in doubt.
   Prints the new post ID (like p_3f9k2a) on stdout:
     id=$(board post -a lead "Starting the auth refactor")
 
@@ -41,12 +43,13 @@ LOGS (live, growing output)
       Runs the command and streams its output live. Marks the post ok
       or error from the exit code and exits with that code.
   make build 2>&1 | board log -a lead -t "build"
-      Streams stdin live.
+      Streams stdin live. Stays info when done: set ok/error yourself.
   Both print the ID first and copy the output to stderr, so you still
   see it. For long commands, run them in the background.
   board append ID TEXT     add text to a log, text or Markdown post
                            (TEXT can also be - or @path)
-  board append ID -s ok    change a post's status (or -t its title)
+  board append ID -s ok    change a post's status (or -t its title);
+                           do this once a blocked or error post is resolved
 
 EXAMPLES
   board post -a lead "Read the codebase. Plan: fix auth, then tests."
@@ -82,15 +85,18 @@ CHARTS
 
 MORE
   board ls [-a NAME] [-n 20]   recent posts: ID AGENT KIND STATUS TITLE
+                               (-a lead also lists lead/* subagents)
   board serve [--port 8000] [--host 127.0.0.1]   start the web page
   Posting works even when the page server is not running; posts are
   saved in ~/.board (set BOARD_DIR to change) and appear when it starts.
-  --json   print the post as JSON instead of the ID (every command)
+  --json   print JSON instead of the ID (every command)
   -q       print nothing on success
   BOARD_URL  post over HTTP to a board on another machine instead
 
 EXIT CODES
-  0 ok    1 rejected (bad ID, wrong post kind)    2 bad command or input
+  0 ok    2 bad command or input (fix the command and retry)
+  1 rejected by the board (unknown ID, wrong post kind, not an image,
+    too large, port in use)
   3 BOARD_URL is set but that server is not reachable
   board log -- CMD exits with CMD's exit code.
 

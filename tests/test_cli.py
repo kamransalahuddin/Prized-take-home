@@ -109,7 +109,7 @@ def test_post_chart_bad_json_reports_position(board):
 
 def test_post_chart_without_series_is_rejected(board):
     r = board("post", "-a", "lead", "--chart", '{"xAxis": {}}')
-    assert r.returncode == 1
+    assert r.returncode == 2
     assert "series" in r.stderr
 
 
@@ -492,3 +492,46 @@ def test_log_survives_board_url_going_away(board_env, stub_url):
     _, err = proc.communicate(timeout=20)
     assert proc.returncode == 5
     assert err.startswith("a\n") and "b\n" in err and "board:" in err
+
+
+# ---- regressions from the CLI validation pass (docs/test-report.md)
+
+
+def test_text_starting_with_dash_is_text(board, store):
+    r = board("post", "-a", "lead", "-3 tests failed", "-s", "error")
+    assert r.returncode == 0, r.stderr
+    p = store.get_post(r.stdout.strip())
+    assert p["payload"]["text"] == "-3 tests failed" and p["status"] == "error"
+    md = board("post", "-a", "lead", "--md", "# notes").stdout.strip()
+    r = board("append", md, "- fixed login")
+    assert r.returncode == 0, r.stderr
+    assert store.get_post(md)["payload"]["markdown"].endswith("- fixed login")
+
+
+def test_at_text_that_is_not_a_path_is_literal(board, store):
+    r = board("post", "-a", "lead", "-s", "blocked", "@human need the DB password")
+    assert r.returncode == 0, r.stderr
+    assert store.get_post(r.stdout.strip())["payload"]["text"] == "@human need the DB password"
+    r = board("post", "-a", "lead", "--md", "@missing/report.md")
+    assert r.returncode == 2 and "file not found" in r.stderr
+
+
+def test_single_line_table_rejected(board):
+    r = board("post", "-a", "lead", "--table", "just text")
+    assert r.returncode == 2 and "header row" in r.stderr
+
+
+def test_serve_port_in_use_is_clean_error(board):
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen()
+    port = s.getsockname()[1]
+    try:
+        r = board("serve", "--port", str(port))
+    finally:
+        s.close()
+    assert r.returncode == 1 and "pick another with --port" in r.stderr
+    assert r.stdout == ""
+    r = board("serve", "--port", "99999")
+    assert r.returncode == 2 and "Traceback" not in r.stderr

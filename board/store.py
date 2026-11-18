@@ -154,6 +154,9 @@ def normalize_table(value: Any) -> dict:
             except csv.Error:
                 dialect = csv.excel
             rows = [r for r in csv.reader(io.StringIO(s), dialect) if r]
+            if len(rows) < 2:
+                raise BoardError("table needs a header row and at least one data row "
+                                 "(JSON array of objects, JSON array of arrays, or CSV)")
             value = rows
     if isinstance(value, dict) and "columns" in value and "rows" in value:
         cols = [str(c) for c in value["columns"]]

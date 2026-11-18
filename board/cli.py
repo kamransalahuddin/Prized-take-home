@@ -10,6 +10,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -89,7 +90,8 @@ class HttpBackend:
         try:
             r = self.client.request(method, path, **kw)
         except self.httpx.TransportError as e:
-            raise Unreachable(f"cannot reach BOARD_URL {self.url}: {e or type(e).__name__}") from e
+            raise Unreachable(f"cannot reach BOARD_URL {self.url}: {e or type(e).__name__}. "
+                              "Start board serve there, or unset BOARD_URL to save posts locally.") from e
         if r.status_code >= 400:
             try:
                 msg = r.json().get("error") or r.text
@@ -163,8 +165,15 @@ def read_value(v: str) -> str:
     if v == "-":
         return read_stdin_bytes().decode("utf-8", "replace")
     if v.startswith("@") and len(v) > 1:
-        return read_file_bytes(v[1:]).decode("utf-8", "replace")
+        path = v[1:]
+        if Path(path).expanduser().is_file() or looks_like_path(path):
+            return read_file_bytes(path).decode("utf-8", "replace")
     return v
+
+
+def looks_like_path(s: str) -> bool:
+    """`@notes/report.md` is a file reference; `@human please approve` is text."""
+    return not any(c.isspace() for c in s) and ("/" in s or "." in s or s.startswith("~"))
 
 
 def agent_name(agent: str | None) -> str:
@@ -393,6 +402,8 @@ def post_cmd(
                 raise InputError(f"chart: invalid JSON at line {e.lineno}, col {e.colno}: {e.msg}") from e
             if not isinstance(opt, dict):
                 raise InputError('chart must be a JSON object (an ECharts option with "series")')
+            if not any(k in opt for k in ("series", "baseOption", "options")):
+                raise InputError('chart must be an ECharts option object with "series"')
             kind, payload = "chart", {"option": opt}
         elif table is not None:
             try:
@@ -547,9 +558,11 @@ def ls_cmd(
 
 @app.command("serve")
 def serve_cmd(
-    port: Annotated[int, typer.Option("--port", "-p")] = 8000,
+    port: Annotated[int, typer.Option("--port", "-p", min=1, max=65535)] = 8000,
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     data: Annotated[Optional[Path], typer.Option("--data")] = None,
+    as_json: JsonOpt = False,
+    quiet: QuietOpt = False,
 ) -> None:
     import httpx
 
@@ -560,10 +573,20 @@ def serve_cmd(
         r = httpx.get(f"http://{probe_host}:{port}/api/posts", params={"limit": 1}, timeout=1.0)
         if r.status_code == 200 and "posts" in r.json():
             warn(f"already running at {url}")
-            out(url)
+            serve_out(url, data_dir, as_json, quiet)
             return
     except Exception:
         pass
+
+    import socket
+
+    try:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+    except OSError as e:
+        raise BoardError(f"cannot listen on {host}:{port}: {e.strerror or e}. "
+                         "Another program may be using it; pick another with --port N.") from e
 
     import uvicorn
 
@@ -574,11 +597,53 @@ def serve_cmd(
     if host in ("0.0.0.0", "::"):
         warn(f"listening on {host} with no auth: anyone who can reach this port can read and post. "
              "Prefer an SSH tunnel (ssh -L 8000:localhost:8000 host).")
-    out(url)
+    serve_out(url, data_dir, as_json, quiet)
     uvicorn.run(application, host=host, port=port, workers=1, timeout_graceful_shutdown=2, log_level="warning")
 
 
+def serve_out(url: str, data_dir: Path, as_json: bool, quiet: bool) -> None:
+    if quiet:
+        return
+    out(dumps({"url": url, "data": str(data_dir)}) if as_json else url)
+
+
 # ---------------------------------------------------------------- entry point
+
+VALUE_OPTS = {
+    "post": {"-a", "--agent", "-t", "--title", "-s", "--status", "-k", "--key",
+             "--md", "--markdown", "--table", "--chart", "--image", "--text"},
+    "append": {"-s", "--status", "-t", "--title"},
+}
+_OPTION_LIKE = re.compile(r"^--?[A-Za-z][A-Za-z0-9-]*(=.*)?$")
+
+
+def protect_dash_text(args: list[str]) -> list[str]:
+    """Let `board post -a x "-3 tests failed"` and `board append ID "- item"` work:
+    a positional value that starts with '-' but is not option-shaped (or contains spaces)
+    is moved after `--` so the parser treats it as text, not an unknown option."""
+    if not args or args[0] not in VALUE_OPTS:
+        return args
+    takes_value = VALUE_OPTS[args[0]]
+    opts, pos, i = [args[0]], [], 1
+    while i < len(args):
+        t = args[i]
+        if t == "--":
+            pos += args[i + 1:]
+            break
+        if t in takes_value and i + 1 < len(args):
+            opts += [t, args[i + 1]]
+            i += 2
+            continue
+        if t.startswith("-") and t != "-" and not _OPTION_LIKE.match(t):
+            pos.append(t)
+        elif t.startswith("-") and t != "-":
+            opts.append(t)
+        else:
+            pos.append(t)
+        i += 1
+    if not any(p.startswith("-") and p != "-" for p in pos):
+        return args
+    return opts + ["--"] + pos
 
 
 def wants_help(args: list[str]) -> bool:
@@ -594,7 +659,7 @@ def run(args: list[str]) -> int:
         return 0
     try:
         command = typer.main.get_command(app)
-        rv = command.main(args, prog_name="board", standalone_mode=False)
+        rv = command.main(protect_dash_text(args), prog_name="board", standalone_mode=False)
         return rv if isinstance(rv, int) else 0
     except InputError as e:
         warn(str(e))
