@@ -224,9 +224,19 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         await hub.start()
         restore = _install_shutdown_hook(hub)
+
+        async def reaper():  # close logs whose `board log` process was killed (-9)
+            while True:
+                with contextlib.suppress(Exception):
+                    if await writer.call("reap_dead_logs"):
+                        hub.nudge.set()
+                await asyncio.sleep(5)
+
+        reap_task = asyncio.create_task(reaper())
         try:
             yield
         finally:
+            reap_task.cancel()
             restore()
             await hub.aclose()
 
@@ -340,7 +350,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         except ValueError:
             raise BoardError("limit must be an integer")
         posts, seq = await reader.call("list_posts", agent=agent or None, limit=n)
-        return {"posts": posts, "seq": seq}
+        return JSONResponse({"posts": posts, "seq": seq}, headers={"X-Board-Data": str(reader.store.dir)})
 
     @app.get("/api/posts/{post_id}")
     async def get_post(post_id: str):

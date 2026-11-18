@@ -1,3 +1,4 @@
+import os
 """Store-level sanity checks (board/store.py is shared by the CLI and the server)."""
 
 import multiprocessing as mp
@@ -119,3 +120,19 @@ def test_concurrent_writer_processes(board_dir):
     posts, seq = s.list_posts(limit=1000)
     assert len(posts) == 150 and len({p["seq"] for p in posts}) == 150 and seq == 150
     s.close()
+
+
+def test_reap_dead_logs_closes_orphaned_live_log(tmp_path):
+    import socket
+    import subprocess
+    from board.store import Store
+    s = Store(tmp_path)
+    p = subprocess.Popen(["sleep", "0"]); p.wait()  # a pid that no longer exists
+    dead, _ = s.create_post("lead", "log", {"pid": p.pid, "host": socket.gethostname()}, live=True)
+    alive, _ = s.create_post("lead", "log", {"pid": os.getpid(), "host": socket.gethostname()}, live=True)
+    other, _ = s.create_post("lead", "log", {"pid": p.pid, "host": "another-machine"}, live=True)
+    assert s.reap_dead_logs() == 1
+    d = s.get_post(dead["id"])
+    assert d["live"] is False and d["status"] == "error" and "ended without reporting" in d["payload"]["text"]
+    assert s.get_post(alive["id"])["live"] is True
+    assert s.get_post(other["id"])["live"] is True

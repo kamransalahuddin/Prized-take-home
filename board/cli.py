@@ -442,7 +442,10 @@ def log_cmd(
     post_id = None
     create_error: Exception | None = None
     try:
-        post, created = be.create_post(agent=a, kind="log", payload={}, title=title, status=s, key=key, live=True)
+        import socket
+
+        owner = {"pid": os.getpid(), "host": socket.gethostname()}
+        post, created = be.create_post(agent=a, kind="log", payload=owner, title=title, status=s, key=key, live=True)
         post["created"] = created
         post_id = post["id"]
         emit(post, as_json, quiet)
@@ -572,14 +575,20 @@ def serve_cmd(
     data_dir = (data or default_data_dir()).expanduser()
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     url = f"http://{host}:{port}"
+    r = None
     try:
         r = httpx.get(f"http://{probe_host}:{port}/api/posts", params={"limit": 1}, timeout=1.0)
-        if r.status_code == 200 and "posts" in r.json():
-            warn(f"already running at {url}")
-            serve_out(url, data_dir, as_json, quiet)
-            return
+        r = r if r.status_code == 200 and "posts" in r.json() else None
     except Exception:
-        pass
+        r = None
+    if r is not None:
+        theirs = r.headers.get("x-board-data")
+        if theirs and Path(theirs).resolve() != data_dir.resolve():
+            raise BoardError(f"a board for {theirs} is already running at {url}; "
+                             f"use another --port to serve {data_dir}")
+        warn(f"already running at {url}")
+        serve_out(url, data_dir, as_json, quiet)
+        return
 
     import socket
 

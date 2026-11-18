@@ -206,8 +206,12 @@ def normalize_payload(kind: str, payload: Any) -> dict:
         if not isinstance(aid, str):
             raise BoardError("image post needs payload.asset_id (upload via POST /api/assets first)")
         return {"asset_id": aid}
-    # log
-    return {"exit_code": payload.get("exit_code"), "truncated": False}
+    # log: pid/host identify the `board log` process so a server can close logs whose
+    # writer died without reporting (kill -9); see Store.reap_dead_logs.
+    out = {"exit_code": payload.get("exit_code"), "truncated": False}
+    if isinstance(payload.get("pid"), int) and isinstance(payload.get("host"), str):
+        out["pid"], out["host"] = payload["pid"], payload["host"][:255]
+    return out
 
 
 # ---------------------------------------------------------------- store
@@ -489,6 +493,32 @@ class Store:
                     "updated_at": ts, "size": size}
 
         return self._tx(tx)
+
+    def reap_dead_logs(self) -> int:
+        """Close live logs whose `board log` process (on this host) no longer exists.
+        Returns how many were closed."""
+        import socket
+
+        host = socket.gethostname()
+        closed = 0
+        for pid_, payload in self.conn.execute("SELECT id, payload FROM posts WHERE kind='log' AND live=1").fetchall():
+            p = json.loads(payload)
+            if p.get("host") != host or not isinstance(p.get("pid"), int):
+                continue
+            try:
+                os.kill(p["pid"], 0)
+                continue  # still running
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue  # exists, owned by someone else
+            try:
+                self.append(pid_, text="[board: the logging process ended without reporting; output may be incomplete]\n",
+                            status="error", done=True)
+                closed += 1
+            except BoardError:
+                pass
+        return closed
 
     # -- assets
 
