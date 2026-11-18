@@ -215,8 +215,19 @@ def _install_shutdown_hook(hub: Hub) -> Callable[[], None]:
     return restore
 
 
+def _sweep_stale_tmp(assets_dir: Path, older_than: float = 600) -> None:
+    """Remove half-written uploads (`.<id>.<ext>.tmp`) left by a crash."""
+    import time as _time
+
+    for f in assets_dir.glob(".*.tmp"):
+        with contextlib.suppress(OSError):
+            if _time.time() - f.stat().st_mtime > older_than:
+                f.unlink()
+
+
 def create_app(data_dir: Path | str | None = None) -> FastAPI:
     reader = Locked(Store(data_dir))
+    _sweep_stale_tmp(reader.store.assets_dir)
     writer = Locked(Store(reader.store.dir))
     hub = Hub(Store(reader.store.dir))
 

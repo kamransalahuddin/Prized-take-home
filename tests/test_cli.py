@@ -477,7 +477,7 @@ def test_post_does_not_import_heavy_modules(board_env):
 
 def test_log_survives_board_url_going_away(board_env, stub_url):
     url, remote, srv = stub_url
-    env = dict(board_env, BOARD_URL=url)
+    env = dict(board_env, BOARD_URL=url, BOARD_FINISH_PATIENCE="1")
     proc = subprocess.Popen(
         [*BOARD_ARGV, "log", "-a", "lead", "--", "sh", "-c", "echo a; sleep 0.5; echo b; exit 5"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -555,3 +555,62 @@ def test_empty_append_is_usage_error(board):
     pid = board("post", "-a", "lead", "x").stdout.strip()
     r = board("append", pid, "")
     assert r.returncode == 2
+
+
+def test_log_end_delivered_after_server_restart(board_env, store, tmp_path):
+    """BOARD_URL log whose server is down when the child exits: the tail and exit code
+    arrive once the server is back (restart-recovery report, bug 2)."""
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    url = f"http://127.0.0.1:{port}"
+    serve = [*BOARD_ARGV, "serve", "--port", str(port)]
+    def start():
+        p = subprocess.Popen(serve, env=board_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
+                return p
+            except OSError:
+                time.sleep(0.05)
+        raise AssertionError("server did not start")
+    srv = start()
+    log = subprocess.Popen(
+        [*BOARD_ARGV, "log", "-a", "lead", "--", "sh", "-c",
+         "for i in 1 2 3 4 5 6 7 8; do echo L$i; sleep 0.2; done; exit 5"],
+        env=dict(board_env, BOARD_URL=url), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pid = log.stdout.readline().strip()
+    time.sleep(0.5)
+    srv.terminate(); srv.wait(5)
+    time.sleep(2.5)  # child finishes while the server is down
+    srv = start()
+    try:
+        log.communicate(timeout=30)
+        assert log.returncode == 5
+        p = store.get_post(pid)
+        assert p["payload"]["text"] == "".join(f"L{i}\n" for i in range(1, 9))
+        assert p["payload"]["exit_code"] == 5 and p["status"] == "error" and p["live"] is False
+    finally:
+        srv.terminate(); srv.wait(5)
+
+
+def test_serve_restarts_immediately_after_kill9_with_open_client(board_env):
+    """Restart-recovery report, bug 1: lingering connections must not block a restart."""
+    import signal as _sig
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    def start():
+        p = subprocess.Popen([*BOARD_ARGV, "serve", "--port", str(port)], env=board_env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        for _ in range(100):
+            try:
+                return p, socket.create_connection(("127.0.0.1", port), timeout=0.1)
+            except OSError:
+                if p.poll() is not None:
+                    raise AssertionError(p.stderr.read())
+                time.sleep(0.05)
+        raise AssertionError("server did not start")
+    srv, conn = start()
+    conn.sendall(b"GET /api/events HTTP/1.1\r\nHost: x\r\n\r\n"); time.sleep(0.3)
+    srv.send_signal(_sig.SIGKILL); srv.wait(5)
+    srv2, conn2 = start()  # must not fail with "Address already in use"
+    conn.close(); conn2.close(); srv2.terminate(); srv2.wait(5)

@@ -26,6 +26,7 @@ from board.help import HELP
 from board.store import BoardError, Store, default_data_dir, normalize_agent, normalize_status, normalize_table, strip_ansi
 
 FLUSH_INTERVAL = 0.25
+FINISH_PATIENCE = float(os.environ.get("BOARD_FINISH_PATIENCE", 60))  # retry final chunk while board is down
 FLUSH_BYTES = 256 * 1024
 MAX_PENDING = 10 * 1024 * 1024
 HINT = "Run 'board help' for usage."
@@ -313,7 +314,7 @@ class Streamer:
                 continue
             backoff = FLUSH_INTERVAL if self._send(text) else min(backoff * 2, 5.0)
 
-    def finish(self, tries: int = 4, **final_kw) -> None:
+    def finish(self, patience: float = FINISH_PATIENCE, **final_kw) -> None:
         """Stop the flusher and send the rest together with the final status change."""
         self.stopping.set()
         self.wake.set()
@@ -325,11 +326,18 @@ class Streamer:
             text = "[board: output was dropped while the board was unreachable]\n" + text
         if not text and not final_kw:
             return
-        for i in range(tries):
+        deadline, delay, told = time.monotonic() + patience, 0.25, False
+        while True:
             if self._send(text, **final_kw):
                 return
             text = self._take(final=True)
-            time.sleep(0.25 * (i + 1))
+            if time.monotonic() + delay > deadline:
+                break
+            if not told:
+                warn(f"board unreachable; retrying for up to {int(patience)}s to post the end of the output")
+                told = True
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
         warn(f"giving up on posting the end of the output to {self.post_id}")
 
 
@@ -595,6 +603,9 @@ def serve_cmd(
     try:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         with socket.socket(family, socket.SOCK_STREAM) as sock:
+            # Same option uvicorn uses: lingering TIME_WAIT / FIN_WAIT connections from a
+            # previous server must not block a restart; a live listener still fails.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
     except OSError as e:
         raise BoardError(f"cannot listen on {host}:{port}: {e.strerror or e}. "
