@@ -21,7 +21,8 @@ POST
 
   VALUE is literal text. "-" reads stdin. "@path" reads a file.
   Text may start with "-" ("-3 tests failed"); text starting with "@" is
-  posted as-is unless it names a file, so pipe it in with - if in doubt.
+  posted as-is unless it names a file or looks like a path (has a / or
+  ends in .md, .csv, ...), so pipe it in with - if in doubt.
   Prints the new post ID (like p_3f9k2a) on stdout:
     id=$(board post -a lead "Starting the auth refactor")
 
@@ -60,6 +61,8 @@ ASK (need a decision? use this instead of -s blocked, then act on it)
   --timeout SECONDS  give up waiting: exit 4, the question stays open
   board wait ID      wait again (ID is on stderr); prints at once if
                      the human already replied
+  Asking again with the same -k replaces the question; a wait on the old
+  one exits 1.
 
 EXAMPLES
   board post -a lead "Read the codebase. Plan: fix auth, then tests."
@@ -106,7 +109,7 @@ MORE
 EXIT CODES
   0 ok    2 bad command or input (fix the command and retry)
   1 rejected by the board (unknown ID, wrong post kind, not an image,
-    too large, port in use)
+    too large, port in use, database locked, server error)
   3 BOARD_URL is set but that server is not reachable
   4 board ask / wait --timeout passed with no reply yet: board wait ID
   board log -- CMD exits with CMD's exit code.
