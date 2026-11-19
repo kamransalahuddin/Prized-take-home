@@ -47,6 +47,9 @@ function Reply({ post }: { post: Post }) {
   // One request id per distinct reply: retrying the same click after a network error reuses
   // it, so the server applies the answer at most once (§4 request_id).
   const attempt = useRef<ReplyAttempt | null>(null)
+  // `board ask --text`: an open question, answered only with typed text.
+  const textOnly = post.payload.ask === "text"
+  const prompt = textOnly ? "Type your answer" : "What should I do instead?"
   async function submit(action: ReplyAction) {
     setPending(true)
     setError("")
@@ -75,25 +78,29 @@ function Reply({ post }: { post: Post }) {
       }}
     >
       <div className="actions">
-        <InteractiveHoverButton
-          type="button"
-          className="approve"
-          disabled={pending || !!sent}
-          onClick={() => submit("approve")}
-        >
-          Approve
-        </InteractiveHoverButton>
-        <InteractiveHoverButton
-          type="button"
-          className="reject"
-          disabled={pending || !!sent}
-          onClick={() => submit("reject")}
-        >
-          Reject
-        </InteractiveHoverButton>
+        {!textOnly && (
+          <>
+            <InteractiveHoverButton
+              type="button"
+              className="approve"
+              disabled={pending || !!sent}
+              onClick={() => submit("approve")}
+            >
+              Approve
+            </InteractiveHoverButton>
+            <InteractiveHoverButton
+              type="button"
+              className="reject"
+              disabled={pending || !!sent}
+              onClick={() => submit("reject")}
+            >
+              Reject
+            </InteractiveHoverButton>
+          </>
+        )}
         <input
-          aria-label="What should I do instead?"
-          placeholder="What should I do instead?"
+          aria-label={prompt}
+          placeholder={prompt}
           value={text}
           maxLength={10000}
           onChange={(e) => setText(e.target.value)}

@@ -431,10 +431,12 @@ def normalize_payload(kind: str, payload: Any) -> dict:
     out = _normalize_payload(kind, payload)
     dumps_checked(out)  # NaN / lone surrogates / too large -> 400 / 413
     ask = payload.get("ask")
-    if ask is not None and not isinstance(ask, bool):
-        raise BoardError("payload.ask must be true or false")
-    if ask is True and kind != "log":
-        out["ask"] = True  # created by `board ask`: the page offers reply buttons
+    if ask is not None and not isinstance(ask, bool) and ask != "text":
+        raise BoardError('payload.ask must be true, false or "text"')
+    if ask in (True, "text") and kind != "log":
+        # created by `board ask`: the page offers reply buttons; "text" (board ask --text):
+        # an open question, answered only with typed text (no Approve/Reject)
+        out["ask"] = ask
     return out
 
 
@@ -1068,6 +1070,8 @@ class Store:
                 raise BoardError("already answered", 409)
             if r["status"] != "blocked":
                 raise BoardError("post is not waiting for input", 409)
+            if payload.get("ask") == "text" and action != "answer":
+                raise BoardError("this question needs a typed answer, not approve/reject")
             ts = now_iso()
             payload["reply"] = {"action": action, "text": text, "at": ts}
             c.execute(

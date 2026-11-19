@@ -248,3 +248,20 @@ describe("needs-you states always come with a way to respond", () => {
     }
   })
 })
+
+describe("board ask --text: open questions get only a text box", () => {
+  it("shows no Approve/Reject for a text-only question, but keeps the answer box", () => {
+    const q = post("data", "blocked", 1, { payload: { text: "Drop or merge the duplicates?", ask: "text" } })
+    const html = renderToStaticMarkup(createElement(AgentDetail, { agent: buildAgents([q])[0] }))
+    expect(html).not.toContain("Approve")
+    expect(html).not.toContain("Reject")
+    expect(html).toContain('placeholder="Type your answer"')
+  })
+
+  it("a yes/no question still has Approve and Reject", () => {
+    const q = post("data", "blocked", 1, { payload: { text: "Ship it?", ask: true } })
+    const html = renderToStaticMarkup(createElement(AgentDetail, { agent: buildAgents([q])[0] }))
+    expect(html).toContain("Approve")
+    expect(html).toContain("Reject")
+  })
+})

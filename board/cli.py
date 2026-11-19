@@ -1418,6 +1418,7 @@ def ask_cmd(
     title: TitleOpt = None,
     key: KeyOpt = None,
     timeout: TimeoutOpt = None,
+    text_only: Annotated[bool, typer.Option("--text")] = False,
     as_json: JsonOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
@@ -1430,7 +1431,7 @@ def ask_cmd(
     if not text.strip():
         raise InputError("the question is empty")
     be = backend()
-    post, _ = be.create_post(agent=a, kind="text", payload={"text": text, "ask": True}, title=title,
+    post, _ = be.create_post(agent=a, kind="text", payload={"text": text, "ask": "text" if text_only else True}, title=title,
                              status="blocked", key=k)
     pid = post["id"]
     warn(f"waiting for the human on {pid} (board wait {pid} to resume)")

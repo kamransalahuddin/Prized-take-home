@@ -1,7 +1,7 @@
 # board: test report
 
 Scope: the `board` CLI, `store.py` (SQLite), `server.py` (REST + SSE), and the page wired to
-them. Final state: 250 Python tests, 53 frontend unit tests and the browser media check (`tests/e2e/media.mjs`) pass. Every finding listed
+them. Final state: 254 Python tests, 57 frontend unit tests and the browser media check (`tests/e2e/media.mjs`) pass. Every finding listed
 below was fixed and has a regression test, unless it is marked as accepted.
 
 ## Method
@@ -108,6 +108,11 @@ One agent per bug, in parallel, each reproducing in a real browser before fixing
    charts or broken images. Two help problems surfaced and were fixed: an example put `-a`
    before the command (`board -a lead/tests …`, exit 2), and "pass -a on every call" made an
    agent pass `-a` to `append`. Help now says where `-a` goes, and the CLI accepts both.
+   Follow-up runs (5–10 more agents) showed that an either/or question ("drop or merge?")
+   still got Approve/Reject, and a bare tap left the agent guessing. `board ask --text` now
+   asks an open question: the page shows only an answer box and the server refuses
+   approve/reject on it. A parent's page also lists its subagents' charts and images, which
+   were only on each subagent's page.
 
 1. **itsdangerous audit:** a lead agent plus 3 subagents (tests, size, review). They posted a
    plan, live pytest logs, timing tables and charts, findings marked `warn`, and a summary.

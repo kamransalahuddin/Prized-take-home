@@ -49,7 +49,7 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   serialized in direct mode too (exit 1, "larger than 8 MB"); tables > 50,000 rows exit 1.
   Also exit 2 / 400: empty or whitespace-only text/Markdown, a table without a header and
   at least one data row (JSON or CSV), chart `series` that is not a list or object,
-  `live` on a non-log post, a non-boolean `payload.ask`, a log `payload.pid` outside
+  `live` on a non-log post, a `payload.ask` other than true/false/`"text"`, a log `payload.pid` outside
   1..2^31-1. Agent names are ≤ 64 chars (the error says so).
 - Hidden aliases: `--text` (= positional TEXT), `--markdown` (= `--md`).
 - `post`: exactly one content source, else exit 2 `use exactly one of TEXT, --md, --table, --chart, --image`.
@@ -116,8 +116,9 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   closed with status `error`). Into a text/Markdown post only the first streamed chunk is
   joined with the separator; later chunks are sent with `raw: true` and continue it
   verbatim, wherever the 250 ms flushes fall. No TEXT and no -s/-t → exit 2. A malformed ID → exit 2.
-- `ask -a NAME [-t T] [-k K] [--timeout SECONDS] [--json] [-q] QUESTION` (QUESTION: value rule):
-  creates a `text` post, status `blocked`, `payload.ask = true`; stderr
+- `ask -a NAME [-t T] [-k K] [--text] [--timeout SECONDS] [--json] [-q] QUESTION` (QUESTION: value rule):
+  creates a `text` post, status `blocked`, `payload.ask = true` (`--text`: `"text"`, an open question
+  answered only with typed text; the reply is then always `answer`); stderr
   `board: waiting for the human on ID (board wait ID to resume)`; then waits like `wait`.
 - `wait ID [--timeout SECONDS] [--json] [-q]`: waits until the post has `payload.reply`, then
   stdout line 1 = `approve` | `reject` | `answer`, then the reply text (if any) on the next
@@ -207,6 +208,8 @@ Post object (from `store.get_post` / `list_posts`, in API responses and `post` e
 snapshot are ordered by `seq` descending (most recently changed first; not by clock).
 
 Human replies (any non-log kind, normally `text`):
+- `payload.ask = "text"` — made by `board ask --text`: the page shows only the answer box, and
+  approve/reject replies are refused (400).
 - `payload.ask = true` — made by `board ask` (the page shows the reply buttons;
   a post made with `-s blocked` without it can be answered too).
 - `payload.reply = {"action": "approve"|"reject"|"answer", "text": str|null,
@@ -248,7 +251,7 @@ locked database is retried for 30 s in total (`StoreBusy`, HTTP 503).
 |---|---|
 | `POST /api/posts` | `{"agent","kind","payload","title"?,"status"?,"key"?,"live"?,"request_id"?}` → 201 post+`"created":true` / 200 on key replace (`"created":false`). Body limit 8 MB (413). `live` must be a JSON boolean (400 otherwise); log `payload.exit_code` an integer or null. |
 | `POST /api/posts/{id}/append` | `{"text"?,"status"?,"title"?,"done"?,"exit_code"?,"newline"?,"raw"?,"expect_kind"?,"expect_gen"?,"request_id"?}` (`done`/`newline`/`raw` booleans; `raw: true` = add text/Markdown without the separator, for stream continuations) → 200 `{"id","seq","status","title","live","updated_at","size"}`; 404 / 409 (wrong kind, or `expect_gen` ≠ the post's `gen`: `post … was replaced (--key) by a newer post; not appending`) |
-| `POST /api/posts/{id}/reply` | `{"action":"approve"\|"reject"\|"answer","text"?,"expect_gen"?,"request_id"?}` (`answer` needs non-empty text; text ≤ 10000 chars) → 200 full post (`payload.reply` set, status `info`, emits `post`); 400 bad action/text · 404 · 409 `{"error":"the question was replaced by a newer one; reload and answer that"}` (`expect_gen` given and ≠ the post's `gen`: the page sends the `gen` of the question it displayed, so an answer never lands on a re-asked question) / `{"error":"already answered"}` / `{"error":"post is not waiting for input"}` (status not `blocked`) |
+| `POST /api/posts/{id}/reply` | `{"action":"approve"\|"reject"\|"answer","text"?,"expect_gen"?,"request_id"?}` (`answer` needs non-empty text; text ≤ 10000 chars) → 200 full post (`payload.reply` set, status `info`, emits `post`); 400 bad action/text, or approve/reject on a `payload.ask = "text"` question · 404 · 409 `{"error":"the question was replaced by a newer one; reload and answer that"}` (`expect_gen` given and ≠ the post's `gen`: the page sends the `gen` of the question it displayed, so an answer never lands on a re-asked question) / `{"error":"already answered"}` / `{"error":"post is not waiting for input"}` (status not `blocked`) |
 | `POST /api/assets` | multipart field `file` (+ optional form field `request_id` or header `X-Request-Id`) → 201 `{"id","mime","size","url"}`; 415 / 413 |
 | `GET /api/posts?agent=&limit=200` | → `{"posts":[...], "seq": N, "epoch": "e3b0c442"}` (N consistent with posts; newest `seq` first; `limit` ASCII digits only, else 400) |
 | `GET /api/posts/{id}` | → post |

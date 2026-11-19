@@ -18,7 +18,6 @@ POST
                                      arrays (first row = header), or CSV
   board post -a NAME --chart VALUE   ECharts option object (see CHARTS)
   board post -a NAME --image FILE    PNG, JPEG, GIF, WebP or SVG
-
   VALUE is literal text. "-" reads stdin. "@path" reads a file; if there
   is no such file it is an error when the rest looks like a path (no
   spaces, and a / or an ending like .md .csv), else the text is posted
@@ -60,9 +59,12 @@ LOGS (live, growing output)
 
 ASK (need a decision? use this instead of -s blocked, then act on it)
   answer=$(board ask -a lead "Can I delete the users table?")
-      Posts a blocked question and waits until the human taps Approve or
-      Reject or types an answer. Prints approve, reject or answer on line
-      1, then any text the human typed on the next lines.
+      Yes/no question: waits until the human taps Approve or Reject or
+      types an answer. Prints approve, reject or answer on line 1, then
+      any text the human typed on the next lines.
+  answer=$(board ask -a lead --text "Drop or merge the 42 duplicates?")
+      Open or either/or question: the human gets only a text box, no
+      buttons. Use it whenever approve/reject can't answer the question.
   --timeout SECONDS  give up waiting: exit 4, the question stays open
   board wait ID      wait again (ID is on stderr; waits through server
                      outages); prints at once if the human replied
@@ -89,7 +91,6 @@ CHARTS
   tooltip, legend and zoom are added for you; set colors only when they
   mean something. For big data (thousands of points) put arrays in
   series[].data, e.g. [[x,y],...], or in dataset.source.
-
   board post -a lead/perf -k latency -t "p95 latency (ms)" --chart - <<'EOF'
   {"xAxis": {"type": "category", "data": ["v1", "v2", "v3", "v4"]},
    "yAxis": {"type": "value"},
@@ -100,8 +101,7 @@ CHARTS
 
 MORE
   board ls [-a NAME] [-n 20]   recent posts: ID AGENT KIND STATUS TITLE
-                               (no header row; TITLE falls back to the
-                               start of the text; -a lead adds lead/*)
+                               (no header row; -a lead adds lead/*)
   board serve [--port 8000] [--host 127.0.0.1]   start the web page
   Posting works even when the page server is not running; posts are
   saved in ~/.board (set BOARD_DIR to change) and appear when it starts.
