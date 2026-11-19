@@ -137,6 +137,14 @@ def test_stalled_client_is_cut_off(tmp_path, monkeypatch):
         while hub.subs and time.time() < deadline:
             time.sleep(0.1)
         assert not hub.subs, "stalled clients were never dropped"
+        # ...and their connections were aborted (not left waiting to flush): reading now ends
+        for s in socks:
+            s.settimeout(5)
+            try:
+                while s.recv(1 << 20):
+                    pass
+            except ConnectionResetError:
+                pass  # aborted: RST
         # a healthy client still works
         evs = read_events(live.url + "/api/events", until=lambda e: e.get("event") == "hello")
         assert evs[-1]["event"] == "hello"

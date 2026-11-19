@@ -119,7 +119,8 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   chunk. Over HTTP, failures are **transient** (connection error, timeout, HTTP 5xx, 408,
   429: the write may or may not have happened, so retry with the same id) or
   **permanent** (other 4xx: never retried). One-shot writes retry transient failures with
-  backoff for `BOARD_WRITE_PATIENCE` seconds (default 20; per-request timeout 10 s), then
+  backoff for `BOARD_WRITE_PATIENCE` seconds (default 20) and at least 4 attempts
+  (per-request timeout 10 s; a timed-out request may have committed), then
   exit 3 (unreachable) or 1 (5xx). Streams retry for as long as the command runs, then
   `BOARD_FINISH_PATIENCE` (default 60) s for the final chunk. A locked local database is
   retried for `BOARD_LOCK_PATIENCE` (default 30) s in total, then exit 1 `database is
@@ -251,7 +252,8 @@ data: {"id":"p_3f9k2a7q","agent":"lead/tests","kind":"log","text":"chunk\n","sta
 - Server limits: replay and the watcher read events in batches of ≤ 500/1000 events and
   ~1 MB; each SSE client may have ≤ 5000 frames / 8 MB queued, else it is dropped (queue
   freed at once; it reconnects and replays); every send has a 30 s timeout, so a stalled
-  or half-open client is cut off and its memory released.
+  or half-open client is cut off (connection aborted, socket released) and its memory
+  freed. On shutdown, streams blocked on such clients end at once.
 - Client: on `post` replace the post if `data.seq > local.seq`; on `append` add `text` to
   the local post's text (log: concat; text: already has `\n` prefix; markdown: `\n\n`
   prefix — the chunk is the exact suffix to concatenate) if `data.seq > local.seq`, then

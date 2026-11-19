@@ -52,6 +52,7 @@ HINT = "Run 'board help' for usage."
 # SAME request_id for this long: a slow request may still commit, and the retry then returns
 # the stored result instead of writing twice.
 WRITE_PATIENCE = float(os.environ.get("BOARD_WRITE_PATIENCE", 20))
+MIN_ATTEMPTS = 4  # ... and at least this many tries
 CREATE_WAIT = 3.0  # `board log` starts the command after this even if the post isn't created yet
 INTERRUPT_PATIENCE = 10.0  # posting the rest of the output after a SIGINT/SIGTERM/SIGHUP
 KILL_GRACE = 5.0  # after forwarding a stop signal, SIGKILL the child's group if still running
@@ -210,14 +211,17 @@ class HttpBackend:
 
     def _retrying(self, patience: float | None, fn: Callable[[], Any]) -> Any:
         """Call fn, retrying transient failures (with backoff) until `patience` seconds have
-        passed; then re-raise the last one. Writes keep their request_id on every retry."""
+        passed (and, with patience > 0, at least MIN_ATTEMPTS tries: a request that timed out
+        may still have committed, so slow attempts must not use up all the tries); then
+        re-raise the last one. Writes keep their request_id on every retry."""
         patience = WRITE_PATIENCE if patience is None else patience
-        start, delay = time.monotonic(), 0.25
+        start, delay, attempts = time.monotonic(), 0.25, 0
         while True:
             try:
+                attempts += 1
                 return fn()
             except Transient:
-                if time.monotonic() - start >= patience:
+                if time.monotonic() - start >= patience and (patience <= 0 or attempts >= MIN_ATTEMPTS):
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 2.0)

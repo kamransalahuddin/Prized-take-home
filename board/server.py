@@ -90,16 +90,52 @@ class StalledClient(OSError):
     """An SSE client did not accept a frame within SEND_TIMEOUT."""
 
 
+def _find_transport(send: Any) -> Any:
+    """The asyncio transport behind an ASGI `send` (uvicorn's cycle object holds it, under a
+    few layers of middleware closures), or None. Used to abort - not gracefully close - a
+    connection whose peer stopped reading: close() would wait forever to flush."""
+    seen, todo = set(), [send]
+    while todo and len(seen) < 200:
+        obj = todo.pop()
+        if id(obj) in seen or obj is None:
+            continue
+        seen.add(id(obj))
+        t = getattr(obj, "transport", None)
+        if t is not None and hasattr(t, "abort"):
+            return t
+        todo.append(getattr(obj, "__self__", None))
+        todo.append(getattr(obj, "func", None))  # functools.partial
+        for cell in getattr(obj, "__closure__", None) or ():
+            with contextlib.suppress(ValueError):
+                if callable(cell.cell_contents) or hasattr(cell.cell_contents, "transport"):
+                    todo.append(cell.cell_contents)
+    return None
+
+
 class SSEResponse(StreamingResponse):
     """StreamingResponse with a timeout on every send: a client that stops reading (or a
-    half-open connection) is cut off instead of holding the generator and its memory."""
+    half-open connection) is cut off instead of holding the generator and its memory.
+    A send blocked on such a client also ends when the server shuts down (`stop`)."""
+
+    def __init__(self, content, stop: asyncio.Event, **kw):
+        super().__init__(content, **kw)
+        self.stop = stop
 
     async def stream_response(self, send) -> None:
+        stopper = asyncio.ensure_future(self.stop.wait())
+
         async def timed(message):
-            try:
-                await asyncio.wait_for(send(message), SEND_TIMEOUT)
-            except asyncio.TimeoutError:
-                raise StalledClient("SSE client stopped reading") from None
+            task = asyncio.ensure_future(send(message))
+            done, _ = await asyncio.wait({task, stopper}, timeout=SEND_TIMEOUT,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if task not in done:
+                task.cancel()
+                transport = _find_transport(send)
+                if transport is not None:
+                    transport.abort()  # release the socket now; the peer isn't reading
+                raise StalledClient("SSE client stopped reading" if not self.stop.is_set()
+                                    else "server shutting down")
+            task.result()
 
         try:
             await timed({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
@@ -107,6 +143,7 @@ class SSEResponse(StreamingResponse):
                 await timed({"type": "http.response.body", "body": chunk, "more_body": True})
             await timed({"type": "http.response.body", "body": b"", "more_body": False})
         finally:
+            stopper.cancel()
             with contextlib.suppress(Exception):
                 await self.body_iterator.aclose()
 
@@ -561,7 +598,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 hub.unsubscribe(sub)
                 sub.drop()
 
-        return SSEResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+        return SSEResponse(stream(), hub.stopping, media_type="text/event-stream", headers=SSE_HEADERS)
 
     # ------------------------------------------------------------------ page
 
