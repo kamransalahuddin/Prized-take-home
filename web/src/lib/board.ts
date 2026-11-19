@@ -229,6 +229,19 @@ export function dropPending(state: MergeState, id: string): MergeState {
 
 // ------------------------------------------------------------------ hook
 
+/** Listeners of mounted useBoard() hooks for posts the page got from its own writes. */
+const localPostListeners = new Set<(post: Post) => void>()
+
+/**
+ * Merge a full post returned by one of the page's own writes (e.g. the reply response) into the
+ * board right away, rendered in the same frame, instead of waiting for its SSE `post` event.
+ * Merged like a fetched post: seq-guarded, so the matching event that follows is a no-op, and
+ * the stream cursor doesn't move.
+ */
+export function applyLocalPost(post: Post): void {
+  for (const listener of localPostListeners) listener(post)
+}
+
 const SNAPSHOT_URL = "/api/posts?limit=2000"
 const EVENT_TYPES = ["hello", "post", "append", "reset", "ping"] as const
 /** The server pings every 15 s; this long without any frame means a stalled connection. */
@@ -402,10 +415,19 @@ export function useBoard(): BoardState {
       }
     }
 
+    const onLocalPost = (post: Post) => {
+      if (disposed) return
+      commit(applyEvent(stateRef.current, "fetched", post).state)
+      cancelFlush?.()
+      flush()
+    }
+    localPostListeners.add(onLocalPost)
+
     void loadSnapshot().then(open)
 
     return () => {
       disposed = true
+      localPostListeners.delete(onLocalPost)
       abort.abort()
       es?.close()
       cancelFlush?.()

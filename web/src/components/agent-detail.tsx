@@ -7,6 +7,8 @@ import { Icon } from "./icon"
 import { StatusLabel } from "./status-label"
 import { PostContent } from "./post-content"
 import type { AgentNode, Post } from "@/lib/types"
+import { applyLocalPost } from "@/lib/board"
+import { nextAttempt, replyBody, sendReply, type ReplyAction, type ReplyAttempt } from "@/lib/reply"
 
 export function postTitle(post: Post) {
   return (
@@ -43,26 +45,23 @@ function Reply({ post }: { post: Post }) {
   const [sent, setSent] = useState("")
   // One request id per distinct reply: retrying the same click after a network error reuses
   // it, so the server applies the answer at most once (§4 request_id).
-  const attempt = useRef<{ key: string; id: string } | null>(null)
-  async function submit(action: string) {
+  const attempt = useRef<ReplyAttempt | null>(null)
+  async function submit(action: ReplyAction) {
     setPending(true)
     setError("")
-    const body = { action, text: text.trim() || null, expect_gen: post.gen }
-    const key = JSON.stringify(body)
-    if (attempt.current?.key !== key)
-      attempt.current = { key, id: crypto.randomUUID?.() ?? String(Math.random()).slice(2) + Date.now() }
-    try {
-      const response = await fetch("/api/posts/" + encodeURIComponent(post.id) + "/reply", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...body, request_id: attempt.current.id }),
-      })
-      const data = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(data.error || "Could not send reply")
+    const body = replyBody(post, action, text)
+    attempt.current = nextAttempt(attempt.current, body)
+    const result = await sendReply(post, body, attempt.current)
+    if (!result.ok) {
+      setError(result.error)
+      setPending(false)
+    } else if (result.post) {
+      // Show the answered post now: this form unmounts in the same render (React batches the
+      // two updates), with no interim "Reply sent" frame before the SSE event lands.
+      applyLocalPost(result.post)
+      setPending(false)
+    } else {
       setSent("Reply sent")
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not send reply")
-    } finally {
       setPending(false)
     }
   }
@@ -108,6 +107,25 @@ function Reply({ post }: { post: Post }) {
     </form>
   )
 }
+/** The update card's headline. While the card's post is the open question its title is shown
+ * above instead; once answered it moves into this (still mounted) card already revealed, rather
+ * than blanking and replaying the blur-in on text that was just on screen. */
+function CardTitle({ title, asQuestion }: { title: string | null; asQuestion: boolean }) {
+  const wasQuestion = useRef(asQuestion)
+  if (asQuestion) wasQuestion.current = true
+  if (!title || asQuestion) return null
+  return (
+    <TextAnimate
+      animation="blurInUp"
+      by="character"
+      once
+      as="h2"
+      {...(wasQuestion.current ? { initial: "show" } : {})}
+    >
+      {title}
+    </TextAnimate>
+  )
+}
 export function AgentDetail({ agent }: { agent: AgentNode }) {
   const question = agent.posts.find(
     (p) => p.status === "blocked" && !p.payload.reply && p.kind !== "log",
@@ -137,7 +155,9 @@ export function AgentDetail({ agent }: { agent: AgentNode }) {
         agent={question ? { ...agent, state: "needs-input" } : agent}
       />
       {question && (
-        <section className="decision" key={question.id}>
+        // Not the bare post id: the update card below can show the same post, and a duplicate
+        // sibling key left this section orphaned on screen after the question was answered.
+        <section className="decision" key={"question:" + question.id}>
           {questionIsMessage ? (
             <PostContent post={question} />
           ) : (
@@ -150,9 +170,7 @@ export function AgentDetail({ agent }: { agent: AgentNode }) {
       )}
       {update && (
         <TweetCard className="update" key={update.id}>
-          {update.title && !(update.id === question?.id) && (
-            <TextAnimate animation="blurInUp" by="character" once as="h2">{update.title}</TextAnimate>
-          )}
+          <CardTitle title={update.title} asQuestion={update.id === question?.id} />
           <PostContent post={update} />
           {update.payload.reply && (
             <p className="response">
