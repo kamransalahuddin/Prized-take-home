@@ -25,7 +25,7 @@ board = "board.cli:main"
 packages = ["board"]
 
 [tool.setuptools.package-data]
-board = ["static/*", "static/vendor/*"]
+board = ["static/*", "static/vendor/*", "static/assets/*", "static/icons/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
