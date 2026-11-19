@@ -54,6 +54,8 @@ function agent(
     lastActivity: posts[0]?.updated_at ?? ago(60),
     latest: posts[0] ?? null,
     posts,
+    questions: posts.filter((p) => p.status === "blocked" && !p.payload.reply),
+    cause: posts[0] && state !== "running" && state !== "done" ? posts[0] : null,
     children,
   }
 }

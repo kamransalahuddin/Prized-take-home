@@ -1,11 +1,12 @@
 import { AgentName } from "./agent-name"
-import { useEffect, useRef, useState } from "react"
+import { Fragment, useEffect, useRef, useState } from "react"
 import { TextAnimate } from "./magicui/text-animate"
 import { InteractiveHoverButton } from "./magicui/interactive-hover-button"
 import { TweetCard } from "./magicui/tweet-card"
 import { Icon } from "./icon"
 import { StatusLabel } from "./status-label"
 import { PostContent } from "./post-content"
+import { avatarFor, displayName, roleLabel } from "@/lib/agents"
 import type { AgentNode, Post } from "@/lib/types"
 import { applyLocalPost } from "@/lib/board"
 import { nextAttempt, replyBody, sendReply, type ReplyAction, type ReplyAttempt } from "@/lib/reply"
@@ -107,36 +108,44 @@ function Reply({ post }: { post: Post }) {
     </form>
   )
 }
-/** The update card's headline. While the card's post is the open question its title is shown
- * above instead; once answered it moves into this (still mounted) card already revealed, rather
- * than blanking and replaying the blur-in on text that was just on screen. */
-function CardTitle({ title, asQuestion }: { title: string | null; asQuestion: boolean }) {
-  const wasQuestion = useRef(asQuestion)
-  if (asQuestion) wasQuestion.current = true
-  if (!title || asQuestion) return null
+/** The update card's headline. A just-answered question moves from the decision area into
+ * this card: show its title already revealed instead of blanking and replaying the blur-in on
+ * text that was just on screen. */
+function CardTitle({ title, revealed }: { title: string | null; revealed: boolean }) {
+  if (!title) return null
   return (
     <TextAnimate
       animation="blurInUp"
       by="character"
       once
       as="h2"
-      {...(wasQuestion.current ? { initial: "show" } : {})}
+      {...(revealed ? { initial: "show" } : {})}
     >
       {title}
     </TextAnimate>
   )
 }
-export function AgentDetail({ agent }: { agent: AgentNode }) {
-  const question = agent.posts.find(
-    (p) => p.status === "blocked" && !p.payload.reply && p.kind !== "log",
+/** Link to the subagent a post came from, shown when a parent's page carries it. */
+function From({ id }: { id: string }) {
+  return (
+    <p className="byline from">
+      <a href={"#agent/" + encodeURIComponent(id)}>
+        <Icon name={avatarFor(id)} size={18} />
+        <AgentName>{displayName(id)}</AgentName> ({roleLabel(id)})
+      </a>
+    </p>
   )
-  const questionIsMessage =
-    question?.kind === "text" || question?.kind === "markdown"
-  // Keep the pending decision above the most recent separate update.
+}
+export function AgentDetail({ agent }: { agent: AgentNode }) {
+  // Every open question (blocked, unanswered, any kind) gets its own Approve/Reject, so the
+  // "Needs input" label always comes with a way to answer (agents.ts decides both).
+  const questions = agent.questions
+  const open = new Set(questions.map((q) => q.id))
+  // Keep the pending decisions above the most recent separate update. A parent that never
+  // posted shows the subagent post behind its "Requires attention".
   const update =
-    question && !questionIsMessage && question.id === agent.latest?.id
-      ? question
-      : agent.posts.find((p) => p.id !== question?.id)
+    agent.posts.find((p) => !open.has(p.id)) ??
+    (agent.state === "attention" ? agent.cause : null)
   return (
     <main className="workspace detail">
       <span aria-hidden="true" className="large-avatar">
@@ -151,26 +160,38 @@ export function AgentDetail({ agent }: { agent: AgentNode }) {
           Updated <Time value={agent.lastActivity} />
         </p>
       </div>
-      <StatusLabel
-        agent={question ? { ...agent, state: "needs-input" } : agent}
-      />
-      {question && (
-        // Not the bare post id: the update card below can show the same post, and a duplicate
-        // sibling key left this section orphaned on screen after the question was answered.
-        <section className="decision" key={"question:" + question.id}>
-          {questionIsMessage ? (
-            <PostContent post={question} />
-          ) : (
-            <TextAnimate animation="blurInUp" by="character" once as="h2">
-              {question.title || "Review requested"}
-            </TextAnimate>
-          )}
-          <Reply post={question} />
-        </section>
-      )}
+      <StatusLabel agent={agent} />
+      {questions.map((question) => {
+        const isMessage = question.kind === "text" || question.kind === "markdown"
+        return (
+          // A re-ask with -k keeps the id but changes gen: start a fresh reply form for it.
+          // Prefixed: the update card below is keyed by a post id, and a sibling with the same
+          // key left this section orphaned on screen after the question was answered.
+          <Fragment key={"question:" + question.id + ":" + (question.gen ?? "")}>
+            {question.agent !== agent.id && <From id={question.agent} />}
+            <section className="decision">
+              {isMessage ? (
+                <PostContent post={question} />
+              ) : (
+                <TextAnimate animation="blurInUp" by="character" once as="h2">
+                  {question.title || "Review requested"}
+                </TextAnimate>
+              )}
+              <Reply post={question} />
+            </section>
+            {!isMessage && (
+              // The table, chart, image or log under review, styled like an update.
+              <TweetCard className="update">
+                <PostContent post={question} />
+              </TweetCard>
+            )}
+          </Fragment>
+        )
+      })}
+      {update && update.agent !== agent.id && <From id={update.agent} />}
       {update && (
         <TweetCard className="update" key={update.id}>
-          <CardTitle title={update.title} asQuestion={update.id === question?.id} />
+          <CardTitle title={update.title} revealed={!!update.payload.reply} />
           <PostContent post={update} />
           {update.payload.reply && (
             <p className="response">
@@ -188,7 +209,7 @@ export function AgentDetail({ agent }: { agent: AgentNode }) {
           )}
         </TweetCard>
       )}
-      {!agent.posts.length && <p className="byline">No updates yet.</p>}
+      {!agent.posts.length && !questions.length && !update && <p className="byline">No updates yet.</p>}
       {!!agent.children.length && (
         <nav className="sub-links" aria-label="Subagents">
           {agent.children.map((c) => (

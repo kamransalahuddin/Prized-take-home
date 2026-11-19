@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { isValidElement, type ReactElement, type ReactNode } from "react"
+import { Fragment, isValidElement, type ReactElement, type ReactNode } from "react"
 import { AgentDetail } from "./agent-detail"
 import { buildAgents } from "@/lib/agents"
 import type { Post } from "@/lib/types"
@@ -23,11 +23,18 @@ function post(id: string, seq: number, extra: Partial<Post> = {}): Post {
   }
 }
 
-/** The direct children of <main> that AgentDetail renders (AgentDetail itself has no hooks). */
-function sections(posts: Post[]): ReactElement[] {
+/** The direct children of <main> that AgentDetail renders (AgentDetail itself has no hooks),
+ * with each open question's Fragment expanded so its decision section is visible too. */
+function rendered(posts: Post[]) {
   const agent = buildAgents(posts)[0]
   const main = AgentDetail({ agent }) as ReactElement<{ children: ReactNode[] }>
-  return main.props.children.flat().filter(isValidElement) as ReactElement[]
+  const top = main.props.children.flat().filter(isValidElement) as ReactElement[]
+  const inner = top.flatMap((e) =>
+    e.type === Fragment
+      ? ([(e.props as { children: ReactNode[] }).children].flat(2).filter(isValidElement) as ReactElement[])
+      : [e],
+  )
+  return { top, inner }
 }
 const keys = (els: ReactElement[]) => els.map((e) => e.key).filter((k) => k !== null)
 const classOf = (e: ReactElement) => String((e.props as { className?: string }).className ?? "")
@@ -35,24 +42,30 @@ const classOf = (e: ReactElement) => String((e.props as { className?: string }).
 const table = { kind: "table" as const, title: "Drop these tables?", payload: { columns: ["t"], rows: [["users"]] } }
 
 describe("AgentDetail decision vs update card", () => {
-  it("never gives the question section and the update card the same key", () => {
-    // A non-message question that is also the latest post fills both slots with one post; with
-    // equal sibling keys React left the answered question's section orphaned on screen.
-    const els = sections([post("p_old", 1), post("p_q", 2, { ...table, status: "blocked" })])
-    expect(els.some((e) => classOf(e) === "decision")).toBe(true)
-    expect(els.some((e) => classOf(e).includes("update"))).toBe(true)
-    const k = keys(els)
-    expect(new Set(k).size).toBe(k.length)
+  it("never gives a question and an update card the same sibling key", () => {
+    // With equal sibling keys React left an answered question's section orphaned on screen.
+    for (const posts of [
+      [post("p_q", 1, { ...table, status: "blocked" as const })],
+      [post("p_old", 1), post("p_q", 2, { ...table, status: "blocked" as const })],
+    ]) {
+      const { top, inner } = rendered(posts)
+      expect(inner.some((e) => classOf(e) === "decision")).toBe(true)
+      const k = keys(top)
+      expect(new Set(k).size).toBe(k.length)
+    }
   })
 
-  it("the update card keeps its key when the question is answered (no remount)", () => {
-    const before = sections([post("p_old", 1), post("p_q", 2, { ...table, status: "blocked" })])
-    const after = sections([
+  it("an answered question leaves the decision area and its title shows already revealed", () => {
+    const { inner } = rendered([
       post("p_old", 1),
       post("p_q", 3, { ...table, payload: { ...table.payload, reply: { action: "approve", text: null, at: "x" } } }),
     ])
-    const card = (els: ReactElement[]) => els.find((e) => classOf(e).includes("update"))
-    expect(after.some((e) => classOf(e) === "decision")).toBe(false)
-    expect(card(after)?.key).toBe(card(before)?.key)
+    expect(inner.some((e) => classOf(e) === "decision")).toBe(false)
+    const card = inner.find((e) => classOf(e).includes("update"))
+    expect(card?.key).toBe("p_q")
+    const title = ([(card!.props as { children: ReactNode[] }).children].flat(2) as ReactElement[]).find(
+      (c) => isValidElement(c) && (c.props as { revealed?: boolean }).revealed !== undefined,
+    )
+    expect((title!.props as { revealed: boolean }).revealed).toBe(true)
   })
 })
