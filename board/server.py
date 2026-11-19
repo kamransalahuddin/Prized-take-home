@@ -273,7 +273,6 @@ class Hub:
                     replaced = False
                 except BoardError as e:
                     if not replaced:
-                        log.error("%s", e.message)
                         print(f"board: ERROR {e.message}", file=sys.stderr, flush=True)
                     replaced = True
             try:
