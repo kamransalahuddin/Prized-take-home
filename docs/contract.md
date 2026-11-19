@@ -68,9 +68,11 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
     (`append -` likewise reads the target post there).
   - Run mode: spawn CMD (no shell) **in its own process group** (`start_new_session`) with
     stdin `/dev/null` (no terminal either: commands that prompt need `-m`, `--yes`, …),
-    stderr merged into stdout, env `PYTHONUNBUFFERED=1` plus `GIT_EDITOR=true` and
-    `GIT_TERMINAL_PROMPT=0` unless already set (git fails fast instead of waiting on an
-    editor or password prompt), default title = command line. SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers are installed before the spawn;
+    stderr merged into stdout, env `PYTHONUNBUFFERED=1` plus `GIT_EDITOR=true`,
+    `GIT_SEQUENCE_EDITOR=true` and `GIT_TERMINAL_PROMPT=0`, always (overriding exported
+    values: git fails fast instead of opening an editor or password prompt nobody can
+    answer; `EDITOR`/`VISUAL` are passed through unchanged, so other tools that start
+    `$EDITOR` still need a non-interactive flag), default title = command line. SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers are installed before the spawn;
     each received signal is forwarded once to the child's whole group (one arriving before
     the spawn: the command is not started). If the child is still running 5 s after a
     forwarded signal, the group gets SIGKILL and board exits 128+N. board finishes when
@@ -79,10 +81,15 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
     (128+N if the child died from signal N). After a forwarded stop signal, once the
     child exits, the rest of its process group gets SIGTERM and, 1 s later, SIGKILL (so
     `sh -c 'sleep 100 & wait'` + Ctrl-C leaves no orphans); without a stop signal,
-    backgrounded grandchildren are left alone. A signal during the final retry stops
+    backgrounded grandchildren are left alone. Processes that left the group survive
+    INT/TERM like `setsid` daemons do: e.g. background jobs of a shell with job control
+    (`sh -c 'set -m; sleep 100 & wait'`), which get their own process groups. A signal during the final retry stops
     retrying (warning with the bytes not posted); the exit code is still the child's.
     Handlers stay installed until board exits, so a storm of signals always exits 128+N
-    of the first one (never killed by a late one). `kill -9` of `board log` itself leaves
+    of the first one (never killed by a late one): they only record the signal and wake
+    a watcher thread (self-pipe), which forwards it and stops retries, so nested handlers
+    cannot deadlock or recurse; at the very end board ignores the stop signals, flushes
+    stdout/stderr and leaves with `os._exit`. `kill -9` of `board log` itself leaves
     its child running (macOS has no parent-death signal); the post is closed by the reaper.
   - Pipe mode (no CMD): read stdin (exit 2 if TTY: `pipe output into board log, or use: board log -a NAME -- CMD`). EOF → `append(id, done=True)`.
     SIGINT/SIGTERM/SIGHUP/SIGQUIT: drain stdin ≤ 1 s, post what was read (≤ 10 s), close
@@ -111,7 +118,8 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   lines (`--json`: one line `{"id","action","text","at"}`); exit 0. Already replied →
   prints at once. Not blocked and no reply → exit 1 `post is not waiting for input`
   (also if it stops being blocked without a reply while waiting). Polls the store every
-  0.5 s, or with `BOARD_URL` `GET /api/posts/{id}` every 1 s, warning once and waiting on
+  0.5 s, or with `BOARD_URL` `GET /api/posts/{id}` every 1 s (each read times out after
+  ≤ 5 s, or what is left of `--timeout`), warning once and waiting on
   while the server is down (connection errors, timeouts, a locked DB; 5xx for ≤ 30 s).
   Anything else (unknown post, bad ID → exit 2, corrupt DB) exits at once. The waiter
   remembers the question's `gen`: if the question is replaced (re-asked with `-k`), it
@@ -121,7 +129,9 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
 - `ls [-a NAME] [-n 20] [--json]`: `store.list_posts(agent, limit, with_payload=False)`;
   TSV lines `ID\tAGENT\tKIND\tSTATUS\tTITLE` (title fallback: first 60 chars of text, else `-`).
   `-n` < 1 → exit 2; `-a /` → exit 2 `bad agent name`. A database this user cannot write
-  is opened read-only (`ls` works; writes still exit 1). Over HTTP `ls` retries for 5 s.
+  is opened read-only (`ls` works; writes still exit 1). Over HTTP `ls` gives up after 5 s
+  (refused connections retried; a server that accepts but never answers: the read timeout
+  is capped at what is left of the 5 s), exit 3.
 - `serve [--port 8000] [--host 127.0.0.1] [--data DIR]`: if port already serves a board
   (`GET /api/posts?limit=1` ok) print `board: already running at URL`, exit 0. Print
   `board: serving http://HOST:PORT  data: DIR` to stderr, URL to stdout. Warn on stderr
