@@ -83,8 +83,10 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
     `sh -c 'sleep 100 & wait'` + Ctrl-C leaves no orphans); without a stop signal,
     backgrounded grandchildren are left alone. Processes that left the group survive
     INT/TERM like `setsid` daemons do: e.g. background jobs of a shell with job control
-    (`sh -c 'set -m; sleep 100 & wait'`), which get their own process groups. A signal during the final retry stops
-    retrying (warning with the bytes not posted); the exit code is still the child's.
+    (`sh -c 'set -m; sleep 100 & wait'`), which get their own process groups. After the first stop signal, posting
+    ends within 10 s of it whatever the server does (a request in flight is cut short then);
+    once the child has exited, a further signal stops posting at once (abandoning a request
+    in flight). Either way board warns with the bytes not posted; the exit code is still the child's.
     Handlers stay installed until board exits, so a storm of signals always exits 128+N
     of the first one (never killed by a late one): they only record the signal and wake
     a watcher thread (self-pipe), which forwards it and stops retries, so nested handlers
@@ -92,9 +94,13 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
     stdout/stderr and leaves with `os._exit`. `kill -9` of `board log` itself leaves
     its child running (macOS has no parent-death signal); the post is closed by the reaper.
   - Pipe mode (no CMD): read stdin (exit 2 if TTY: `pipe output into board log, or use: board log -a NAME -- CMD`). EOF → `append(id, done=True)`.
-    SIGINT/SIGTERM/SIGHUP/SIGQUIT: drain stdin ≤ 1 s, post what was read (≤ 10 s), close
-    the post (`done`, status `error`), exit 128+N. If posting stopped for good (warned, e.g.
-    disk full) board still drains stdin, then exits 1, like `append -`.
+    SIGINT/SIGTERM/SIGHUP/SIGQUIT: drain stdin ≤ 1 s, post what was read and close the post
+    (`done`, status `error`) within 10 s of the signal (a request in flight is cut short
+    then), exit 128+N; a second signal stops posting at once. A signal while the end of the
+    output is being posted after EOF likewise limits that to 10 s (a second one stops it)
+    and exits 128+N. If posting stopped for good (warned, e.g. disk full) board still drains
+    stdin, then exits 1, like `append -`; if the end of the output could not be posted in
+    time (warned with the bytes not posted) it exits 3 (never connected) or 1.
   - Reader thread copies every byte to stderr (unless `-q`) and buffers; flusher sends
     `append(id, text, expect_gen=GEN)` every 250 ms or at 256 KB (≤ 256 K chars per chunk).
     Strip ANSI (`store.strip_ansi`). Store/HTTP failure never kills the child or stops the
@@ -118,8 +124,8 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   lines (`--json`: one line `{"id","action","text","at"}`); exit 0. Already replied →
   prints at once. Not blocked and no reply → exit 1 `post is not waiting for input`
   (also if it stops being blocked without a reply while waiting). Polls the store every
-  0.5 s, or with `BOARD_URL` `GET /api/posts/{id}` every 1 s (each read times out after
-  ≤ 5 s, or what is left of `--timeout`), warning once and waiting on
+  0.5 s, or with `BOARD_URL` `GET /api/posts/{id}` every 1 s (each read gives up after
+  ≤ 5 s in total, or what is left of `--timeout`, even if the answer trickles in), warning once and waiting on
   while the server is down (connection errors, timeouts, a locked DB; 5xx for ≤ 30 s).
   Anything else (unknown post, bad ID → exit 2, corrupt DB) exits at once. The waiter
   remembers the question's `gen`: if the question is replaced (re-asked with `-k`), it
@@ -130,8 +136,8 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   TSV lines `ID\tAGENT\tKIND\tSTATUS\tTITLE` (title fallback: first 60 chars of text, else `-`).
   `-n` < 1 → exit 2; `-a /` → exit 2 `bad agent name`. A database this user cannot write
   is opened read-only (`ls` works; writes still exit 1). Over HTTP `ls` gives up after 5 s
-  (refused connections retried; a server that accepts but never answers: the read timeout
-  is capped at what is left of the 5 s), exit 3.
+  in total (refused connections retried; a server that accepts but never answers, or
+  trickles its answer: the request is cut off at what is left of the 5 s), exit 3.
 - `serve [--port 8000] [--host 127.0.0.1] [--data DIR]`: if port already serves a board
   (`GET /api/posts?limit=1` ok) print `board: already running at URL`, exit 0. Print
   `board: serving http://HOST:PORT  data: DIR` to stderr, URL to stdout. Warn on stderr
@@ -155,12 +161,17 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   chunk. Over HTTP, failures are **transient** (connection error, timeout, HTTP 5xx, 408,
   429: the write may or may not have happened, so retry with the same id) or
   **permanent** (other 4xx: never retried). One-shot writes retry transient failures with
-  backoff for `BOARD_WRITE_PATIENCE` seconds (default 20) and at least 4 attempts
-  (connect timeout 3 s, read timeout 30 s: a slow answer is not a failure; a timed-out
-  request may have committed; if every attempt took longer, give up after 3× the
-  patience), then exit 3 (never connected) or 1 (5xx, or a request that was sent but
-  never answered: "may already have been applied (request id …)"). Streams retry for as long as the command runs, then
-  `BOARD_FINISH_PATIENCE` (default 60) s for the final chunk. A locked local database is
+  backoff for `BOARD_WRITE_PATIENCE` seconds (default 20) and at least 2 attempts.
+  Timeouts: connect 3 s; each attempt may take what is left of the patience in total
+  (headers and body: an answer trickled in byte by byte is cut off too), at least 4 s
+  and at most 30 s, and the first attempt leaves 4 s for a second one, so a server that
+  never answers costs about the patience (~20 s), not more. A slow answer within that is
+  not a failure; a timed-out request may have committed (its retry, with the same id,
+  returns the stored result). Then exit 3 (never connected) or 1 (5xx, or a request that
+  was sent but never answered: "may already have been applied (request id …)"). No HTTP
+  request of the CLI ever takes longer than 30 s in total. Streams retry for as long as
+  the command runs, then `BOARD_FINISH_PATIENCE` (default 60) s for the final chunk (in
+  all, including a request still in flight; ≤ 10 s after a stop signal). A locked local database is
   retried for `BOARD_LOCK_PATIENCE` (default 30) s in total, then exit 1 `database is
   locked by another process`. An invalid patience value (not a number, negative, NaN,
   inf) is ignored with one warning and the default is used.
