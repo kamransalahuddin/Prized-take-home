@@ -33,13 +33,15 @@ MAX_ASSET = 20 * 1024 * 1024
 MAX_TABLE_ROWS = 50_000
 MAX_REPLY = 10_000
 REPLY_ACTIONS = ("approve", "reject", "answer")
-REQUEST_TTL = 24 * 3600  # idempotency records older than this are pruned
+REQUEST_KEEP = 100_000  # newest idempotency records kept (by insertion order, not by clock)
 MAX_PAYLOAD = 8 * 1024 * 1024  # serialized payload cap (same as the HTTP body limit)
 MAX_KEY = 100
 MAX_TITLE = 200
-LOCK_PATIENCE = float(os.environ.get("BOARD_LOCK_PATIENCE", 30))  # total wait for a locked DB
+MAX_DEPTH = 64  # nesting limit for JSON values (chart options, table cells, API bodies)
+MAX_PID = 2**31 - 1
 EVENT_KEEP = 20_000  # events kept for SSE replay; older clients get `reset` (refetch)
-SCHEMA_VERSION = 2
+EVENT_BYTES = 64 * 1024 * 1024  # ... and at most about this many bytes of event data
+SCHEMA_VERSION = 3
 _B32 = "abcdefghijklmnopqrstuvwxyz234567"
 
 SCHEMA = """
@@ -78,7 +80,8 @@ CREATE TABLE IF NOT EXISTS events (
   type       TEXT NOT NULL,          -- 'post' | 'append'
   post_id    TEXT NOT NULL,
   data       TEXT NOT NULL,          -- JSON event payload (see docs/contract.md)
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  size       INTEGER                 -- bytes of data (bounds the table by size)
 );
 CREATE TABLE IF NOT EXISTS requests (   -- idempotency: request_id -> stored result
   id         TEXT PRIMARY KEY,
@@ -93,6 +96,31 @@ CREATE TABLE IF NOT EXISTS meta (       -- epoch: random id of this database (SS
 );
 INSERT OR IGNORE INTO meta(key, value) VALUES ('epoch', lower(hex(randomblob(4))));
 """
+
+
+def env_seconds(name: str, default: float) -> float:
+    """A non-negative, finite number of seconds from the environment variable `name`, or
+    `default` (with one warning on stderr) if it is unset, empty or invalid."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        v = float("nan")
+    if not (0 <= v < float("inf")):  # also rejects NaN
+        import sys
+
+        try:
+            sys.stderr.write(f"board: ignoring {name}={raw!r} (not a number of seconds >= 0); "
+                             f"using {default:g}\n")
+        except (OSError, ValueError, AttributeError):
+            pass
+        return default
+    return v
+
+
+LOCK_PATIENCE = env_seconds("BOARD_LOCK_PATIENCE", 30)  # total wait for a locked DB
 
 
 class BoardError(Exception):
@@ -123,16 +151,75 @@ def _reject_constant(name: str):
     raise ValueError(f"{name} is not valid JSON (use null or a number)")
 
 
-def loads_strict(s: str, what: str) -> Any:
-    """json.loads that rejects NaN/Infinity and absurd nesting with a BoardError."""
+def _finite_float(s: str) -> float:
+    v = float(s)
+    if v in (float("inf"), float("-inf")):
+        raise ValueError(f"number {s[:40]} is too large (it overflows to Infinity)")
+    return v
+
+
+def depth_ok(obj: Any, limit: int = MAX_DEPTH) -> bool:
+    """True if lists/objects in `obj` nest at most `limit` levels (iterative: safe on any
+    depth). A scalar has depth 0, [] / {} depth 1."""
+    stack = [(obj, 1)]
+    while stack:
+        o, d = stack.pop()
+        if isinstance(o, (dict, list)):
+            if d > limit:
+                return False
+            for c in (o.values() if isinstance(o, dict) else o):
+                if isinstance(c, (dict, list)):
+                    stack.append((c, d + 1))
+    return True
+
+
+def _too_deep(what: str, limit: int) -> BoardError:
+    return BoardError(f"{what}: JSON is nested too deeply (more than {limit} levels)")
+
+
+def loads_strict(s: str, what: str, depth: int = MAX_DEPTH) -> Any:
+    """json.loads that rejects NaN/Infinity (also numbers that overflow to it) and nesting
+    deeper than `depth` with a BoardError."""
     try:
-        return json.loads(s, parse_constant=_reject_constant)
+        v = json.loads(s, parse_constant=_reject_constant, parse_float=_finite_float)
     except json.JSONDecodeError as e:
         raise BoardError(f"{what}: invalid JSON at line {e.lineno}, col {e.colno}: {e.msg}")
     except RecursionError:
-        raise BoardError(f"{what}: JSON is nested too deeply")
+        raise _too_deep(what, depth)
     except ValueError as e:
         raise BoardError(f"{what}: {e}")
+    if not depth_ok(v, depth):
+        raise _too_deep(what, depth)
+    return v
+
+
+def _event_data(raw: str, seq: int, post_id: str) -> dict:
+    """Decode a stored event; a payload too deep to serialize again is replaced."""
+    try:
+        data = json.loads(raw)
+    except (RecursionError, ValueError):
+        data = None
+    if isinstance(data, dict) and not depth_ok(data, MAX_DEPTH + 8):
+        if isinstance(data.get("payload"), (dict, list)):
+            data["payload"] = {"error": "payload is nested too deeply to show"}
+        if not depth_ok(data, MAX_DEPTH + 8):
+            data = None
+    if not isinstance(data, dict):
+        return {"id": post_id, "seq": seq, "error": "event could not be read"}
+    return data
+
+
+def loads_stored(s: str, what: str = "payload") -> Any:
+    """Decode JSON written by this module. Data that is too deep to serialize again (stored
+    by an older version without the depth limit) becomes {"error": ...} so that responses,
+    events and snapshots never fail on it."""
+    try:
+        v = json.loads(s)
+    except (RecursionError, ValueError):
+        return {"error": f"{what} could not be read (corrupt or nested too deeply)"}
+    if not depth_ok(v, MAX_DEPTH + 8):
+        return {"error": f"{what} is nested too deeply to show"}
+    return v
 
 
 def dumps_checked(obj: Any, what: str = "payload", limit: int | None = MAX_PAYLOAD) -> str:
@@ -146,7 +233,7 @@ def dumps_checked(obj: Any, what: str = "payload", limit: int | None = MAX_PAYLO
     except ValueError as e:
         raise BoardError(f"{what}: NaN and Infinity are not allowed (use null): {e}")
     except RecursionError:
-        raise BoardError(f"{what}: nested too deeply")
+        raise _too_deep(what, MAX_DEPTH)
     if limit is not None and n > limit:
         raise BoardError(f"{what} is larger than {limit // (1024 * 1024)} MB", 413)
     return s
@@ -237,7 +324,9 @@ def normalize_agent(agent: str | None) -> str:
     a = (agent or "").strip().lower()
     if not a:
         raise BoardError("-a/--agent is required (e.g. -a lead, or -a lead/tests for a subagent)")
-    if len(a) > 64 or not AGENT_RE.match(a):
+    if len(a) > 64:
+        raise BoardError(f"bad agent name {agent!r}: agent names are at most 64 characters")
+    if not AGENT_RE.match(a):
         raise BoardError(
             f"bad agent name {agent!r}: use lowercase letters, digits, . _ - and / for subagents (e.g. lead/tests)"
         )
@@ -325,17 +414,30 @@ def normalize_table(value: Any) -> dict:
     if len(rows) > MAX_TABLE_ROWS:
         raise BoardError(f"table has {len(rows)} rows; the limit is {MAX_TABLE_ROWS}", 413)
     width = max([len(cols)] + [len(r) for r in rows])
+    if not rows or not width:
+        raise BoardError("table needs a header row and at least one data row "
+                         "(JSON array of objects, JSON array of arrays, or CSV)")
     cols += [""] * (width - len(cols))
     rows = [r + [None] * (width - len(r)) for r in rows]
     return {"columns": cols, "rows": rows}
 
 
 def normalize_payload(kind: str, payload: Any) -> dict:
+    if not depth_ok(payload, MAX_DEPTH + 1):  # +1: the payload object itself
+        raise _too_deep("payload", MAX_DEPTH)
     out = _normalize_payload(kind, payload)
-    dumps_checked(out)  # NaN / lone surrogates / too deep / too large -> 400 / 413
-    if payload.get("ask") is True and kind != "log":
+    dumps_checked(out)  # NaN / lone surrogates / too large -> 400 / 413
+    ask = payload.get("ask")
+    if ask is not None and not isinstance(ask, bool):
+        raise BoardError("payload.ask must be true or false")
+    if ask is True and kind != "log":
         out["ask"] = True  # created by `board ask`: the page offers reply buttons
     return out
+
+
+def check_chart(opt: dict) -> None:
+    if "series" in opt and not isinstance(opt["series"], (list, dict)):
+        raise BoardError('chart "series" must be a list of series (or one series object)')
 
 
 def _normalize_payload(kind: str, payload: Any) -> dict:
@@ -346,10 +448,14 @@ def _normalize_payload(kind: str, payload: Any) -> dict:
     if kind == "text":
         if not isinstance(payload.get("text"), str):
             raise BoardError("text post needs payload.text")
+        if not payload["text"].strip():
+            raise BoardError("the text is empty")
         return {"text": payload["text"]}
     if kind == "markdown":
         if not isinstance(payload.get("markdown"), str):
             raise BoardError("markdown post needs payload.markdown")
+        if not payload["markdown"].strip():
+            raise BoardError("the Markdown is empty")
         return {"markdown": payload["markdown"]}
     if kind == "table":
         return normalize_table(payload if "columns" in payload else payload.get("table", payload))
@@ -357,6 +463,7 @@ def _normalize_payload(kind: str, payload: Any) -> dict:
         opt = payload.get("option")
         if not isinstance(opt, dict) or not ("series" in opt or "baseOption" in opt or "options" in opt):
             raise BoardError('chart must be an ECharts option object with "series"')
+        check_chart(opt)
         return {"option": opt}
     if kind == "image":
         aid = payload.get("asset_id")
@@ -369,8 +476,11 @@ def _normalize_payload(kind: str, payload: Any) -> dict:
     if ec is not None and (isinstance(ec, bool) or not isinstance(ec, int)):
         raise BoardError("exit_code must be an integer")
     out = {"exit_code": ec, "truncated": False}
-    if isinstance(payload.get("pid"), int) and isinstance(payload.get("host"), str):
-        out["pid"], out["host"] = payload["pid"], payload["host"][:255]
+    pid = payload.get("pid")
+    if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or not 1 <= pid <= MAX_PID):
+        raise BoardError(f"payload.pid must be a process id between 1 and {MAX_PID}")
+    if isinstance(pid, int) and isinstance(payload.get("host"), str):
+        out["pid"], out["host"] = pid, payload["host"][:255]
         if isinstance(payload.get("pstart"), str):
             out["pstart"] = payload["pstart"][:64]
     return out
@@ -380,11 +490,15 @@ def _normalize_payload(kind: str, payload: Any) -> dict:
 
 
 class Store:
-    def __init__(self, data_dir: str | Path | None = None):
+    def __init__(self, data_dir: str | Path | None = None, readonly: bool = False):
         self.dir = Path(data_dir).expanduser() if data_dir else default_data_dir()
         self.assets_dir = self.dir / "assets"
-        self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.dir / "board.db"
+        self.readonly = readonly
+        if readonly:
+            self._open_readonly()
+            return
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, timeout=LOCK_PATIENCE, isolation_level=None,
                                     check_same_thread=False)
         try:
@@ -397,8 +511,11 @@ class Store:
             tables = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if tables - {"sqlite_sequence"} and "posts" not in tables:
                 raise sqlite3.DatabaseError("not a database written by board (no posts table)")
-            self._retry(lambda: self.conn.executescript(SCHEMA))
-            self._migrate()
+            current = "meta" in tables and \
+                self.conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION
+            if not current:  # (an up-to-date database is opened without writing anything)
+                self._retry(lambda: self.conn.executescript(SCHEMA))
+                self._migrate()
             self._validate_schema()
         except sqlite3.DatabaseError as e:
             self.conn.close()
@@ -413,15 +530,43 @@ class Store:
         self._ident = self._file_ident(self.db_path)
         self._wal_ident = self._file_ident(Path(str(self.db_path) + "-wal"))
 
+    def _open_readonly(self) -> None:
+        """For read commands on a database this user cannot write (read-only file or data
+        dir): open it without creating or migrating anything."""
+        from urllib.parse import quote
+
+        if not self.db_path.is_file():
+            raise BoardError(f"no board database at {self.db_path}", 404)
+        base = "file:" + quote(str(self.db_path.resolve()))
+        last: Exception | None = None
+        # mode=ro needs the -shm file to be usable; a fully read-only directory without
+        # one only opens as immutable (fine for a one-shot read).
+        for uri in (base + "?mode=ro", base + "?mode=ro&immutable=1"):
+            conn = sqlite3.connect(uri, uri=True, timeout=LOCK_PATIENCE, isolation_level=None,
+                                   check_same_thread=False)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute(f"PRAGMA busy_timeout={int(LOCK_PATIENCE * 1000)}")
+                self.conn = conn
+                self._validate_schema(write=False)
+                self.epoch = conn.execute("SELECT value FROM meta WHERE key='epoch'").fetchone()[0]
+            except sqlite3.DatabaseError as e:
+                conn.close()
+                last = e
+                if _not_a_db(e) or "no such table" in str(e).lower():
+                    break
+                continue
+            self._ident = self._file_ident(self.db_path)
+            self._wal_ident = self._file_ident(Path(str(self.db_path) + "-wal"))
+            return
+        raise BoardError(f"{self.db_path} cannot be read: {last}", 500)
+
     # -- plumbing
 
     def _migrate(self) -> None:
-        """Add columns that older databases lack (posts.gen, requests.fp)."""
+        """Add columns that older databases lack (posts.gen, requests.fp, events.size)."""
         def cols(c, table):
             return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
-
-        if "gen" in cols(self.conn, "posts") and "fp" in cols(self.conn, "requests"):
-            return
 
         def tx(c):
             if "gen" not in cols(c, "posts"):
@@ -429,6 +574,11 @@ class Store:
                 c.execute("UPDATE posts SET gen=lower(hex(randomblob(8))) WHERE gen IS NULL")
             if "fp" not in cols(c, "requests"):
                 c.execute("ALTER TABLE requests ADD COLUMN fp TEXT")
+            if "size" not in cols(c, "events"):
+                c.execute("ALTER TABLE events ADD COLUMN size INTEGER")
+                c.execute("UPDATE events SET size=LENGTH(CAST(data AS BLOB))")
+            # Covering index: the byte total is summed without reading the event data.
+            c.execute("CREATE INDEX IF NOT EXISTS events_size ON events(id, size)")
 
         self._tx(tx)
 
@@ -437,16 +587,16 @@ class Store:
                   "updated_at", "seq", "gen"},
         "log_chunks": {"post_id", "n", "text", "created_at"},
         "assets": {"id", "filename", "mime", "size", "created_at"},
-        "events": {"id", "type", "post_id", "data", "created_at"},
+        "events": {"id", "type", "post_id", "data", "created_at", "size"},
         "requests": {"id", "result", "created_at", "fp"},
     }
 
-    def _validate_schema(self) -> None:
+    def _validate_schema(self, write: bool = True) -> None:
         for table, want in self._COLUMNS.items():
             have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if not want <= have:
                 raise sqlite3.DatabaseError(f"table {table} lacks columns {sorted(want - have)}")
-        if self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        if write and self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             self._retry(lambda: self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}"))
 
     @staticmethod
@@ -469,7 +619,8 @@ class Store:
     def close(self) -> None:
         try:
             with contextlib.suppress(sqlite3.Error):
-                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                if not self.readonly:
+                    self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         finally:
             self.conn.close()
 
@@ -535,10 +686,10 @@ class Store:
             "gen": r["gen"],
         }
         if with_payload:
-            payload = json.loads(r["payload"])
+            payload = loads_stored(r["payload"])
             if r["kind"] == "log":
                 payload["text"] = self._log_text(c, r["id"])
-            if r["kind"] == "image":
+            if r["kind"] == "image" and isinstance(payload.get("asset_id"), str):
                 payload["url"] = f"/api/assets/{payload['asset_id']}"
                 a = c.execute("SELECT mime FROM assets WHERE id=?", (payload["asset_id"],)).fetchone()
                 payload["mime"] = a[0] if a else None
@@ -587,7 +738,7 @@ class Store:
             if out and total + len(r[3]) > max_bytes:
                 break
             total += len(r[3])
-            out.append({"id": r[0], "type": r[1], "post_id": r[2], "data": json.loads(r[3])})
+            out.append({"id": r[0], "type": r[1], "post_id": r[2], "data": _event_data(r[3], r[0], r[2])})
         return out
 
     def min_event_id(self) -> int:
@@ -601,12 +752,29 @@ class Store:
             (etype, post_id, "{}", now_iso()),
         )
         seq = cur.lastrowid
-        if seq % 1000 == 0:  # keep the events table bounded; replay older than this -> reset
-            c.execute("DELETE FROM events WHERE id <= ?", (seq - EVENT_KEEP,))
         data["seq"] = seq
-        c.execute("UPDATE events SET data=? WHERE id=?", (json.dumps(data, ensure_ascii=False), seq))
+        raw = json.dumps(data, ensure_ascii=False)
+        size = len(raw.encode("utf-8", "surrogatepass"))
+        c.execute("UPDATE events SET data=?, size=? WHERE id=?", (raw, size, seq))
         c.execute("UPDATE posts SET seq=? WHERE id=?", (seq, post_id))
+        # Keep the events table bounded by count and by bytes (a big log must not make every
+        # resuming client replay gigabytes); replay from before the kept range -> reset.
+        if seq % 1000 == 0:
+            c.execute("DELETE FROM events WHERE id <= ?", (seq - EVENT_KEEP,))
+        if seq % 200 == 0 or size >= 64 * 1024:
+            self._prune_event_bytes(c)
         return seq
+
+    def _prune_event_bytes(self, c: sqlite3.Connection) -> None:
+        total = c.execute("SELECT COALESCE(SUM(size), 0) FROM events").fetchone()[0]
+        if total <= EVENT_BYTES:
+            return
+        row = c.execute(
+            "SELECT id FROM (SELECT id, SUM(size) OVER (ORDER BY id DESC) AS c FROM events) "
+            "WHERE c > ? ORDER BY id DESC LIMIT 1", (EVENT_BYTES,)).fetchone()
+        if row:  # never the newest event itself
+            newest = c.execute("SELECT MAX(id) FROM events").fetchone()[0]
+            c.execute("DELETE FROM events WHERE id <= ?", (min(row[0], newest - 1),))
 
     def _stored(self, c: sqlite3.Connection, op: str, request_id: str | None, fp: str | None = None) -> Any:
         """The stored result of an earlier write with this request_id, or None. The same
@@ -638,7 +806,8 @@ class Store:
             "INSERT INTO requests(id, result, created_at, fp) VALUES (?,?,?,?)",
             (request_id, json.dumps({"op": op, "result": result}, ensure_ascii=False), now_iso(), fp),
         )
-        c.execute("DELETE FROM requests WHERE created_at < ?", (iso_at(time.time() - REQUEST_TTL),))
+        # By insertion order, not wall clock: a clock jump must not forget recent request ids.
+        c.execute("DELETE FROM requests WHERE rowid <= (SELECT MAX(rowid) FROM requests) - ?", (REQUEST_KEEP,))
 
     def create_post(
         self,
@@ -665,6 +834,8 @@ class Store:
         key = normalize_key(key)
         if not isinstance(live, bool):
             raise BoardError("live must be true or false")
+        if live and kind != "log":
+            raise BoardError("live only applies to log posts")
         if kind == "image":
             if not self.conn.execute("SELECT 1 FROM assets WHERE id=?", (payload["asset_id"],)).fetchone():
                 raise BoardError(f"no asset {payload['asset_id']}", 404)
@@ -701,14 +872,25 @@ class Store:
 
         def run(c):
             stored = self._stored(c, "create_post", request_id, fp)
-            if stored is not None:  # a retry: re-read the post (only its id is stored)
+            if stored is not None:  # a retry: re-read the post (its id and gen are stored)
                 res = stored["result"]
                 if isinstance(res, dict):
-                    return [self.get_post(res["id"], c), res["created"]]
-                return res  # older databases stored the whole post
+                    post = self.get_post(res["id"], c)
+                    if res.get("gen") is not None and post["gen"] != res["gen"]:
+                        # Replaced (--key) by a newer request since: never hand back the
+                        # newer post as if this request had made it.
+                        raise BoardError(f"post {res['id']} was replaced (--key) by a newer post since "
+                                         "this request; not using it", 409)
+                    return [post, res["created"]]
+                if isinstance(res, list) and res and isinstance(res[0], dict) and res[0].get("id"):
+                    # older databases stored the whole post (without gen): fill it in
+                    with contextlib.suppress(BoardError):
+                        res[0].setdefault("gen", self.get_post(res[0]["id"], c)["gen"])
+                return res
             post, created = tx(c)
             if request_id is not None:
-                self._remember(c, "create_post", request_id, {"id": post["id"], "created": created}, fp)
+                self._remember(c, "create_post", request_id,
+                               {"id": post["id"], "created": created, "gen": post["gen"]}, fp)
             return [post, created]
 
         post, created = self._tx(run)
@@ -726,11 +908,13 @@ class Store:
         expect_kind: str | None = None,
         request_id: str | None = None,
         expect_gen: str | None = None,
+        raw: bool = False,
     ) -> dict:
         """Append text to a log/text/markdown post and/or change status/title/live.
 
         log: text added verbatim (newline=True adds a trailing \\n if missing — one-off appends).
-        text: joined with \\n. markdown: joined with \\n\\n.
+        text: joined with \\n. markdown: joined with \\n\\n. raw=True: no separator (the
+        continuation of a stream whose first chunk was already joined).
         exit_code set → payload.exit_code, status ok/error unless status given; done → live false.
         Emits an 'append' event when text was added, else a 'post' event (full post).
         Returns a light result {id, seq, status, title, live, updated_at, size}.
@@ -750,16 +934,20 @@ class Store:
             status = normalize_status(status)
         if text is not None and "\r" in text:
             text = _collapse_cr(text)
+        expect_kind = expect_kind or None
+        expect_gen = expect_gen or None
+        if not isinstance(raw, bool):
+            raise BoardError("raw must be true or false")
 
         def tx(c: sqlite3.Connection):
             r = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
             if not r:
                 raise BoardError(f"no post {post_id}", 404)
             kind = r["kind"]
-            if expect_kind and kind != expect_kind:
-                raise BoardError(f"post {post_id} is now a {kind} post (replaced with --key); not appending", 409)
             if expect_gen and r["gen"] != expect_gen:
                 raise BoardError(f"post {post_id} was replaced (--key) by a newer post; not appending", 409)
+            if expect_kind and kind != expect_kind:
+                raise BoardError(f"post {post_id} is a {kind} post, not a {expect_kind} post; not appending", 409)
             if exit_code is not None and kind != "log":
                 raise BoardError("exit_code only applies to log posts", 409)
             payload = json.loads(r["payload"])
@@ -807,7 +995,7 @@ class Store:
                                 excess = 0
                 else:
                     field = "text" if kind == "text" else "markdown"
-                    sep = "\n" if kind == "text" else "\n\n"
+                    sep = "" if raw else "\n" if kind == "text" else "\n\n"
                     chunk = sep + text
                     payload[field] = payload[field] + chunk
             c.execute(
@@ -839,8 +1027,11 @@ class Store:
             return {"id": post_id, "seq": seq, "status": new_status, "title": new_title, "live": bool(live),
                     "updated_at": ts, "size": size}
 
-        fp = fingerprint("append", [post_id, text, status, title, bool(done), exit_code, bool(newline),
-                                    expect_kind, expect_gen])
+        fp_title = title.strip()[:MAX_TITLE] if title is not None else None
+        fp_args = [post_id, text, status, fp_title, bool(done), exit_code, bool(newline), expect_kind, expect_gen]
+        if raw:
+            fp_args.append("raw")
+        fp = fingerprint("append", fp_args)
         return self._tx(lambda c: self._idem(c, "append", request_id, tx, fp))
 
     def reply(self, post_id: str, action: str, text: str | None = None, request_id: str | None = None,
@@ -857,6 +1048,7 @@ class Store:
             raise BoardError("text must be a string")
         if text is not None and not text.strip():
             text = None
+        expect_gen = expect_gen or None
         if action == "answer" and text is None:
             raise BoardError("answer needs text")
         if text is not None and len(text) > MAX_REPLY:
@@ -889,10 +1081,20 @@ class Store:
             stored = self._stored(c, "reply", request_id, fp)
             if stored is not None:
                 res = stored["result"]
-                return self.get_post(res["id"], c) if set(res) == {"id"} else res
+                if not isinstance(res, dict) or "id" not in res or not set(res) <= {"id", "gen", "at"}:
+                    return res  # older databases stored the whole post
+                post = self.get_post(res["id"], c)
+                rep = post["payload"].get("reply") if isinstance(post.get("payload"), dict) else None
+                if "gen" in res and (post["gen"] != res["gen"] or not rep or rep.get("at") != res.get("at")):
+                    # Re-asked / re-opened since: don't present the newer question as the
+                    # one this request answered.
+                    raise BoardError(f"post {res['id']} was replaced or re-opened since this reply was "
+                                     "recorded; reload it", 409)
+                return post
             post = tx(c)
             if request_id is not None:
-                self._remember(c, "reply", request_id, {"id": post_id}, fp)
+                self._remember(c, "reply", request_id,
+                               {"id": post_id, "gen": post["gen"], "at": post["payload"]["reply"]["at"]}, fp)
             return post
 
         return self._tx(run)
@@ -905,28 +1107,38 @@ class Store:
         host = socket.gethostname()
         closed = 0
         for pid_, payload in self.conn.execute("SELECT id, payload FROM posts WHERE kind='log' AND live=1").fetchall():
-            p = json.loads(payload)
-            if p.get("host") != host or not isinstance(p.get("pid"), int):
-                continue  # another machine's process: don't guess
-            alive = True
+            try:  # one odd row must never stop the others from being reaped
+                if self._reap_one(pid_, payload, host):
+                    closed += 1
+            except StoreBusy:
+                raise
+            except Exception:
+                continue
+        return closed
+
+    def _reap_one(self, post_id: str, payload: str, host: str) -> bool:
+        p = json.loads(payload)
+        pid = p.get("pid") if isinstance(p, dict) else None
+        if p.get("host") != host or isinstance(pid, bool) or not isinstance(pid, int):
+            return False  # another machine's process: don't guess
+        alive = 1 <= pid <= MAX_PID  # out of range (stored by an older version): not a process
+        if alive:
             try:
-                os.kill(p["pid"], 0)
+                os.kill(pid, 0)
             except ProcessLookupError:
                 alive = False
             except PermissionError:
                 pass  # exists, owned by someone else
-            if alive and p.get("pstart"):
-                now = proc_start(p["pid"])
-                alive = now is None or now == p["pstart"]  # different start time: pid was reused
-            if alive:
-                continue
-            try:
-                self.append(pid_, text="[board: the logging process ended without reporting; output may be incomplete]\n",
-                            status="error", done=True)
-                closed += 1
-            except BoardError:
-                pass
-        return closed
+            except (OverflowError, ValueError, OSError):
+                alive = False
+        if alive and p.get("pstart"):
+            now = proc_start(pid)
+            alive = now is None or now == p["pstart"]  # different start time: pid was reused
+        if alive:
+            return False
+        self.append(post_id, text="[board: the logging process ended without reporting; output may be incomplete]\n",
+                    status="error", done=True)
+        return True
 
     # -- assets
 
@@ -943,11 +1155,16 @@ class Store:
         aid = new_id("a_", 8)
         filename = f"{aid}.{ext}"
         tmp = self.assets_dir / f".{filename}.tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.assets_dir / filename)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.assets_dir / filename)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()  # (disk full, ...): leave no half-written file behind
+            raise
 
         def tx(c: sqlite3.Connection):
             c.execute(
@@ -972,11 +1189,30 @@ class Store:
             "SELECT id, filename FROM assets WHERE created_at < ? AND id NOT IN "
             "(SELECT json_extract(payload, '$.asset_id') FROM posts WHERE kind='image')", (cutoff,)
         ).fetchall()
+        n = 0
         for aid, filename in rows:
-            self._tx(lambda c: c.execute("DELETE FROM assets WHERE id=?", (aid,)))
-            with contextlib.suppress(OSError):
+            # File first: a crash in between leaves a row whose file is gone (a 404, and the
+            # next sweep removes the row), never an unreferenced file nobody sweeps.
+            try:
                 (self.assets_dir / filename).unlink()
-        return len(rows)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+            self._tx(lambda c: c.execute("DELETE FROM assets WHERE id=?", (aid,)))
+            n += 1
+        # Files no row refers to (a crash between writing the file and the insert).
+        known = {r[0] for r in self.conn.execute("SELECT filename FROM assets")}
+        limit = time.time() - older_than
+        with contextlib.suppress(OSError):
+            for f in list(self.assets_dir.iterdir()):
+                if f.name.startswith(".") or f.name in known or not f.is_file():
+                    continue
+                with contextlib.suppress(OSError):
+                    if f.stat().st_mtime < limit:
+                        f.unlink()
+                        n += 1
+        return n
 
     def get_asset(self, asset_id: str) -> tuple[Path, str]:
         r = self.conn.execute("SELECT filename, mime FROM assets WHERE id=?", (asset_id,)).fetchone()

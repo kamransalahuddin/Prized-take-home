@@ -43,9 +43,14 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   traceback. `-h`/`--help` means help only as a standalone token, not as an option value
   (`board post -a x -t -h text` posts with title `-h`).
 - Keys: ≤ 100 chars, not blank (else exit 2 / HTTP 400; never truncated). Titles longer
-  than 200 chars are cut (the CLI warns). JSON input (chart/table/API) rejects NaN/Infinity
-  and absurd nesting (exit 2 / 400). Payloads are capped at 8 MB serialized in direct mode
-  too (exit 1, "larger than 8 MB"); tables > 50,000 rows exit 1.
+  than 200 chars are cut (the CLI warns). JSON input (chart/table/API) rejects NaN/Infinity,
+  numbers that overflow to Infinity (`1e999`) and nesting deeper than 64 levels (exit 2 /
+  400; checked before sending in `BOARD_URL` mode too). Payloads are capped at 8 MB
+  serialized in direct mode too (exit 1, "larger than 8 MB"); tables > 50,000 rows exit 1.
+  Also exit 2 / 400: empty or whitespace-only text/Markdown, a table without a header and
+  at least one data row (JSON or CSV), chart `series` that is not a list or object,
+  `live` on a non-log post, a non-boolean `payload.ask`, a log `payload.pid` outside
+  1..2^31-1. Agent names are ≤ 64 chars (the error says so).
 - Hidden aliases: `--text` (= positional TEXT), `--markdown` (= `--md`).
 - `post`: exactly one content source, else exit 2 `use exactly one of TEXT, --md, --table, --chart, --image`.
   `-a/--agent` (fallback `BOARD_AGENT`), `-t/--title`, `-s/--status`, `-k/--key`, `--json`, `-q`.
@@ -58,22 +63,33 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
     buffered, so a create that commits late is the post that receives the output. The
     command starts as soon as the post exists, or after 3 s regardless (warning; the ID is
     printed when the post is created). If it is never created, warn once with the number
-    of bytes not posted.
+    of bytes not posted. The backend (the store, which can wait 30 s on a lock) is opened
+    in the flusher thread too, so it never delays the command start or the stdin drain
+    (`append -` likewise reads the target post there).
   - Run mode: spawn CMD (no shell) **in its own process group** (`start_new_session`) with
-    stdin `/dev/null`, stderr merged into stdout, env `PYTHONUNBUFFERED=1`, default title =
-    command line. SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers are installed before the spawn;
+    stdin `/dev/null` (no terminal either: commands that prompt need `-m`, `--yes`, …),
+    stderr merged into stdout, env `PYTHONUNBUFFERED=1` plus `GIT_EDITOR=true` and
+    `GIT_TERMINAL_PROMPT=0` unless already set (git fails fast instead of waiting on an
+    editor or password prompt), default title = command line. SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers are installed before the spawn;
     each received signal is forwarded once to the child's whole group (one arriving before
     the spawn: the command is not started). If the child is still running 5 s after a
     forwarded signal, the group gets SIGKILL and board exits 128+N. board finishes when
     the child itself exits (pipe drained for ≤ 1 s more; background grandchildren holding
     the pipe are left alone): `append(id, done=True, exit_code=rc)`; board exits with rc
-    (128+N if the child died from signal N). A signal during the final retry stops retrying
-    (warning with the bytes not posted); the exit code is still the child's.
+    (128+N if the child died from signal N). After a forwarded stop signal, once the
+    child exits, the rest of its process group gets SIGTERM and, 1 s later, SIGKILL (so
+    `sh -c 'sleep 100 & wait'` + Ctrl-C leaves no orphans); without a stop signal,
+    backgrounded grandchildren are left alone. A signal during the final retry stops
+    retrying (warning with the bytes not posted); the exit code is still the child's.
+    Handlers stay installed until board exits, so a storm of signals always exits 128+N
+    of the first one (never killed by a late one). `kill -9` of `board log` itself leaves
+    its child running (macOS has no parent-death signal); the post is closed by the reaper.
   - Pipe mode (no CMD): read stdin (exit 2 if TTY: `pipe output into board log, or use: board log -a NAME -- CMD`). EOF → `append(id, done=True)`.
     SIGINT/SIGTERM/SIGHUP/SIGQUIT: drain stdin ≤ 1 s, post what was read (≤ 10 s), close
-    the post (`done`, status `error`), exit 128+N.
+    the post (`done`, status `error`), exit 128+N. If posting stopped for good (warned, e.g.
+    disk full) board still drains stdin, then exits 1, like `append -`.
   - Reader thread copies every byte to stderr (unless `-q`) and buffers; flusher sends
-    `append(id, text, expect_gen=GEN)` every 250 ms or at 256 KB (≤ 1 M chars per chunk).
+    `append(id, text, expect_gen=GEN)` every 250 ms or at 256 KB (≤ 256 K chars per chunk).
     Strip ANSI (`store.strip_ansi`). Store/HTTP failure never kills the child or stops the
     echo (buffer ≤10 MB): transient failures (HTTP connect/timeout/5xx, a locked DB) are
     retried; permanent ones (4xx, post replaced → 409, disk full, read-only, not a board DB,
@@ -84,7 +100,9 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
 - `append ID [TEXT] [-s S] [-t T] [--json] [-q]`: TEXT literal / `-` / `@path`;
   one-off literal → `store.append(id, text, newline=True)`; `-` streams like log pipe mode
   (with the post's `gen` as `expect_gen`; signals flush and exit 128+N; a log post is also
-  closed with status `error`). No TEXT and no -s/-t → exit 2. A malformed ID → exit 2.
+  closed with status `error`). Into a text/Markdown post only the first streamed chunk is
+  joined with the separator; later chunks are sent with `raw: true` and continue it
+  verbatim, wherever the 250 ms flushes fall. No TEXT and no -s/-t → exit 2. A malformed ID → exit 2.
 - `ask -a NAME [-t T] [-k K] [--timeout SECONDS] [--json] [-q] QUESTION` (QUESTION: value rule):
   creates a `text` post, status `blocked`, `payload.ask = true`; stderr
   `board: waiting for the human on ID (board wait ID to resume)`; then waits like `wait`.
@@ -102,15 +120,23 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   stays open. Ctrl-C → exit 130. `-q`: print nothing.
 - `ls [-a NAME] [-n 20] [--json]`: `store.list_posts(agent, limit, with_payload=False)`;
   TSV lines `ID\tAGENT\tKIND\tSTATUS\tTITLE` (title fallback: first 60 chars of text, else `-`).
+  `-n` < 1 → exit 2; `-a /` → exit 2 `bad agent name`. A database this user cannot write
+  is opened read-only (`ls` works; writes still exit 1). Over HTTP `ls` retries for 5 s.
 - `serve [--port 8000] [--host 127.0.0.1] [--data DIR]`: if port already serves a board
   (`GET /api/posts?limit=1` ok) print `board: already running at URL`, exit 0. Print
   `board: serving http://HOST:PORT  data: DIR` to stderr, URL to stdout. Warn on stderr
   when host is `0.0.0.0` (no auth; use an SSH tunnel). Runs uvicorn with
-  `timeout_graceful_shutdown=2`, one worker.
+  `timeout_graceful_shutdown=2`, one worker. SIGINT/SIGTERM/SIGHUP/SIGQUIT all shut down
+  cleanly (WAL checkpoint), exit 0. A closed stdout/stderr is reopened on `/dev/null`.
+  Bind errors name the cause: unknown host name, address not on this machine, port in use,
+  permission denied.
 - stdout: post ID + `\n` (or one-line JSON with `--json`). Everything else → stderr.
 - Exit codes: 0 ok · 1 rejected (`BoardError`, HTTP 4xx, 5xx after retries, database
   locked > 30 s, disk full / read-only / not a board database) · 2 usage/input (incl. a
   data path that is not a directory or too long) · 3 `BOARD_URL` unreachable after retries
+  (no connection; ~20 s for a write, ~5 s for `ls`) · 1 also when a write reached the
+  server but no answer came back within the retries (`the write may already have been
+  applied (request id …); check with board ls`)
   · 4 `ask`/`wait` timed out with no reply · `log -- CMD` → CMD's code. Errors are one
   `board: …` line on stderr, never a traceback. A closed stdout never fails a command.
 - Idempotent writes: the CLI sends a fresh uuid4 `request_id` with every logical write
@@ -120,11 +146,14 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   429: the write may or may not have happened, so retry with the same id) or
   **permanent** (other 4xx: never retried). One-shot writes retry transient failures with
   backoff for `BOARD_WRITE_PATIENCE` seconds (default 20) and at least 4 attempts
-  (per-request timeout 10 s; a timed-out request may have committed), then
-  exit 3 (unreachable) or 1 (5xx). Streams retry for as long as the command runs, then
+  (connect timeout 3 s, read timeout 30 s: a slow answer is not a failure; a timed-out
+  request may have committed; if every attempt took longer, give up after 3× the
+  patience), then exit 3 (never connected) or 1 (5xx, or a request that was sent but
+  never answered: "may already have been applied (request id …)"). Streams retry for as long as the command runs, then
   `BOARD_FINISH_PATIENCE` (default 60) s for the final chunk. A locked local database is
   retried for `BOARD_LOCK_PATIENCE` (default 30) s in total, then exit 1 `database is
-  locked by another process`.
+  locked by another process`. An invalid patience value (not a number, negative, NaN,
+  inf) is ignored with one warning and the default is used.
 - Direct mode closes orphaned live logs (see `reap_dead_logs`) at most once a minute from
   `board post` / `board ls` (marker file `BOARD_DIR/.reaped`).
 
@@ -151,7 +180,7 @@ Post object (from `store.get_post` / `list_posts`, in API responses and `post` e
 | table | `{"columns": ["a","b"], "rows": [["1", 2], ...]}` cells: str/number/bool/null |
 | chart | `{"option": {ECharts option}}` |
 | image | `{"asset_id":"a_9c1d7e2f","url":"/api/assets/a_9c1d7e2f","mime":"image/png"}` |
-| log | `{"text":"...","truncated":false,"exit_code":null}` (last 2 MB kept) |
+| log | `{"text":"...","truncated":false,"exit_code":null}` (last 2,097,152 code points kept) |
 
 `seq` = id of the last event that touched the post. Global, monotonic. Lists and the
 snapshot are ordered by `seq` descending (most recently changed first; not by clock).
@@ -173,12 +202,21 @@ text, status, title, done, exit_code, newline, expect_kind, expect_gen / action,
 expect_gen / image bytes). In the same transaction: a known id with the same `fp` returns
 the stored result without writing; a known id with a different `fp` (other operation,
 post or arguments) → 409 `request_id was already used for a different request`. For
-create/reply only the post id is stored and the post is re-read on replay. Rows older than
-1 day are pruned on write. (Rows from older versions without `fp` match on op only.)
+create the post id, `created` and the post's `gen` are stored and the post is re-read on
+replay; if its `gen` changed since (replaced with `--key` by a newer request) the replay
+is a 409 `post … was replaced (--key) by a newer post since this request`, never the
+newer post (so a late retry of a first `board log` / `board ask` cannot adopt the second
+one). For reply the post id, `gen` and reply time are stored; if the question was
+re-asked / re-opened since, the replay is a 409 (`… was replaced or re-opened since …`).
+The newest 100,000 rows are kept (pruned by insertion order, not by clock: a clock jump
+cannot forget recent ids). (Rows from older versions without `fp` match on op only; an
+old-format stored create gets the current `gen` filled in.)
 
-Storage limits: logs keep exactly the last 2,000,000 characters (code points;
-`truncated: true` once trimmed). The `events` table keeps the last 20,000 events; a resume
-from before that gets `reset`. `meta(key, value)` holds the database `epoch` (random,
+Storage limits: logs keep exactly the last 2,097,152 (2 × 1024 × 1024) characters (code
+points; `truncated: true` once trimmed). The `events` table keeps the last 20,000 events
+and at most ~64 MB of event data (`events.size`; the oldest beyond either limit are
+pruned); a resume from before that gets `reset`. Stored data too deeply nested to
+serialize (written by an older version) is served as `{"error": …}` instead of failing. `meta(key, value)` holds the database `epoch` (random,
 created with the schema). Opening a file that is not a board database (or an incompatible
 one) fails with `… is not a board database (or is from an incompatible version)`. A
 locked database is retried for 30 s in total (`StoreBusy`, HTTP 503).
@@ -188,10 +226,10 @@ locked database is retried for 30 s in total (`StoreBusy`, HTTP 503).
 | Method/path | Body → Response |
 |---|---|
 | `POST /api/posts` | `{"agent","kind","payload","title"?,"status"?,"key"?,"live"?,"request_id"?}` → 201 post+`"created":true` / 200 on key replace (`"created":false`). Body limit 8 MB (413). `live` must be a JSON boolean (400 otherwise); log `payload.exit_code` an integer or null. |
-| `POST /api/posts/{id}/append` | `{"text"?,"status"?,"title"?,"done"?,"exit_code"?,"newline"?,"expect_kind"?,"expect_gen"?,"request_id"?}` (`done`/`newline` booleans) → 200 `{"id","seq","status","title","live","updated_at","size"}`; 404 / 409 (wrong kind, or `expect_gen` ≠ the post's `gen`: `post … was replaced (--key) by a newer post; not appending`) |
+| `POST /api/posts/{id}/append` | `{"text"?,"status"?,"title"?,"done"?,"exit_code"?,"newline"?,"raw"?,"expect_kind"?,"expect_gen"?,"request_id"?}` (`done`/`newline`/`raw` booleans; `raw: true` = add text/Markdown without the separator, for stream continuations) → 200 `{"id","seq","status","title","live","updated_at","size"}`; 404 / 409 (wrong kind, or `expect_gen` ≠ the post's `gen`: `post … was replaced (--key) by a newer post; not appending`) |
 | `POST /api/posts/{id}/reply` | `{"action":"approve"\|"reject"\|"answer","text"?,"expect_gen"?,"request_id"?}` (`answer` needs non-empty text; text ≤ 10000 chars) → 200 full post (`payload.reply` set, status `info`, emits `post`); 400 bad action/text · 404 · 409 `{"error":"the question was replaced by a newer one; reload and answer that"}` (`expect_gen` given and ≠ the post's `gen`: the page sends the `gen` of the question it displayed, so an answer never lands on a re-asked question) / `{"error":"already answered"}` / `{"error":"post is not waiting for input"}` (status not `blocked`) |
 | `POST /api/assets` | multipart field `file` (+ optional form field `request_id` or header `X-Request-Id`) → 201 `{"id","mime","size","url"}`; 415 / 413 |
-| `GET /api/posts?agent=&limit=200` | → `{"posts":[...], "seq": N, "epoch": "e3b0c442"}` (N consistent with posts; newest `seq` first) |
+| `GET /api/posts?agent=&limit=200` | → `{"posts":[...], "seq": N, "epoch": "e3b0c442"}` (N consistent with posts; newest `seq` first; `limit` ASCII digits only, else 400) |
 | `GET /api/posts/{id}` | → post |
 | `GET /api/assets/{id}` | bytes, stored MIME, `Cache-Control: public, max-age=31536000, immutable`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox` |
 | `GET /api/events` | SSE, see §5 |
@@ -203,9 +241,11 @@ different request → 409 (see §3).
 
 Errors: 4xx are permanent (fix the request). 5xx are transient and safe to retry with the
 same `request_id`: 503 `{"error":"database is locked by another process …"}`, 503
-`{"error":"board data directory was removed or replaced; restart board serve …"}` (the
-server checks `board.db` and its `-wal` still are the files it opened — before every write
-and every second; it never reports success for a write into a deleted database), 503
+`{"error":"board data directory was removed or replaced and cannot be reopened …"}` (the
+server checks `board.db` and its `-wal` still are the files it opened — before every read
+and write and every second; if not, it reopens the data dir's new database (new epoch, so
+SSE clients are disconnected and get `reset`), and never reads from or reports success for
+a write into a deleted database), 503
 `board database error: …` / `board storage error: …` (sqlite / OS errors, e.g. disk full).
 Invalid JSON, NaN/Infinity, lone surrogates (`"\ud800"`), absurd nesting, wrong types → 400.
 
@@ -234,20 +274,31 @@ data: {"id":"p_3f9k2a7q","agent":"lead/tests","kind":"log","text":"chunk\n","sta
        "title":"pytest","live":true,"truncated":false,"exit_code":null,
        "updated_at":"...","seq":1043}
 
-: ping            (every 15 s, on a timer, whether or not events are flowing)
+event: ping
+data: {"t": 1763484312}     (every 15 s, on a timer, whether or not events are flowing;
+                             no id: Last-Event-ID is unaffected. A named event because
+                             EventSource hides `:` comments from scripts: a page can
+                             reconnect when nothing arrived for 45 s.)
 ```
 
-`reset` carries `{"seq": N, "epoch": "…"}`: refetch the snapshot.
+`reset` carries `{"seq": N, "epoch": "…"}` (and `id: EPOCH:N`): refetch the snapshot.
 
 - Server: register subscriber queue FIRST, then replay `events_after(since)` in batches,
   then stream live; drop any event with id ≤ last sent (dedupe). If `since` is older than
-  `min_event_id()-1` (shouldn't happen; events are never deleted) send `event: reset`.
+  `min_event_id()-1` (the events were pruned) send `event: reset`. Events are never skipped
+  silently: if pruning overtakes a slow replay (a batch does not start at last+1), the
+  stream sends `reset` and goes on from the current end; if the live watcher falls behind
+  pruning (server stalled while > 20,000 events / 64 MB were written), every stream is
+  ended and reconnects into a `reset`. `reset` carries `id: EPOCH:SEQ` (the position the
+  stream continues from), so the browser's Last-Event-ID moves to the current epoch and the
+  next reconnect does not reset again; `hello` and `ping` carry no id.
 - `post` = create / key replace (new `gen`) / reply / re-blocking an answered post (full
   object). `append` = every other change to an existing post: a text chunk and/or the
   current status/title/live/truncated/exit_code. A status/title/`done`/exit_code change
-  without new text is an `append` with `"text": ""` (never a full post: a log can be 2 MB).
-- Log truncation is deterministic: the server keeps exactly the last 2,000,000 code points
-  of the concatenated chunks. Client: append each chunk, then keep the last 2,000,000 code
+  without new text is an `append` with `"text": ""` (never a full post: a log can be over 2 MB).
+- Log truncation is deterministic: the server keeps exactly the last 2,097,152
+  (2 × 1024 × 1024) code points of the concatenated chunks. Client: append each chunk,
+  then keep the last 2,097,152 code
   points (and show "truncated" when the event says so).
 - Server limits: replay and the watcher read events in batches of ≤ 500/1000 events and
   ~1 MB; each SSE client may have ≤ 5000 frames / 8 MB queued, else it is dropped (queue

@@ -64,7 +64,8 @@ def test_http_reply_replay_after_reask_with_other_gen_is_409(client):
     body = {"action": "approve", "request_id": "RK1", "expect_gen": q1["gen"]}
     assert client.post(f"/api/posts/{q1['id']}/reply", json=body).status_code == 200
     q2 = ask(client, "v2", key="K")
-    assert client.post(f"/api/posts/{q1['id']}/reply", json=body).status_code == 200  # true replay: stored
+    r = client.post(f"/api/posts/{q1['id']}/reply", json=body)  # replay, but the question was re-asked
+    assert r.status_code == 409 and "replaced" in r.json()["error"]  # never the new question as answered
     r = client.post(f"/api/posts/{q1['id']}/reply", json=dict(body, expect_gen=q2["gen"]))
     assert r.status_code == 409
     assert client.get(f"/api/posts/{q1['id']}").json()["status"] == "blocked"

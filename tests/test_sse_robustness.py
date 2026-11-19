@@ -175,7 +175,9 @@ def test_pings_are_sent_while_busy(tmp_path, monkeypatch):
         t0 = time.time()
         with httpx.stream("GET", live.url + "/api/events", timeout=5) as r:
             for line in r.iter_lines():
-                pings += line == ": ping"
+                pings += line == "event: ping"
+                if line.startswith("data: {\"t\""):
+                    assert isinstance(json.loads(line[6:])["t"], int)
                 if time.time() - t0 > 1.5:
                     break
         assert pings >= 2

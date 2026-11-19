@@ -269,9 +269,24 @@ def test_server_refuses_writes_after_data_dir_removed(tmp_path):
     d = tmp_path / "srv"
     with TestClient(create_app(d)) as c:
         assert c.post("/api/posts", json={"agent": "x", "kind": "text", "payload": {"text": "a"}}).status_code == 201
+        old_epoch = c.get("/api/posts").json()["epoch"]
         shutil.rmtree(d)
+        # Never a write into (or a read from) the deleted file: the server reopens the new one.
         r = c.post("/api/posts", json={"agent": "x", "kind": "text", "payload": {"text": "b"}})
-        assert r.status_code == 503 and "removed or replaced" in r.json()["error"]
+        assert r.status_code == 201
+        snap = c.get("/api/posts").json()
+        assert [p["payload"]["text"] for p in snap["posts"]] == ["b"] and snap["epoch"] != old_epoch
+        assert [p["payload"]["text"] for p in Store(d).list_posts()[0]] == ["b"]
+
+
+def test_server_reads_follow_a_replaced_data_dir(tmp_path):
+    import shutil
+    d = tmp_path / "srv"
+    with TestClient(create_app(d)) as c:
+        assert c.post("/api/posts", json={"agent": "x", "kind": "text", "payload": {"text": "a"}}).status_code == 201
+        shutil.rmtree(d)
+        Store(d).create_post("y", "text", {"text": "direct"})  # a CLI post after rm -rf
+        assert [p["payload"]["text"] for p in c.get("/api/posts").json()["posts"]] == ["direct"]
 
 
 def test_lock_wait_has_one_overall_deadline(board, board_dir, store, tmp_path):
@@ -320,7 +335,7 @@ def test_events_pruned_and_small_request_results(store, monkeypatch):
     assert store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] < 1000
     assert store.min_event_id() > 1
     stored = json.loads(store.conn.execute("SELECT result FROM requests WHERE id='big'").fetchone()[0])
-    assert stored["result"] == {"id": p["id"], "created": True}
+    assert stored["result"] == {"id": p["id"], "created": True, "gen": p["gen"]}
     again, created = store.create_post("x", "log", {}, live=True, request_id="big")
     assert again["id"] == p["id"] and created and again["payload"]["text"].startswith("0\n")
 
