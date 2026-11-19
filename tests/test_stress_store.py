@@ -27,7 +27,7 @@ def test_request_id_reused_with_different_body_is_409(store):
     with pytest.raises(BoardError) as e:
         store.reply(b2["id"], "reject", "no", request_id="r")
     assert e.value.status == 409 and store.get_post(b2["id"])["status"] == "blocked"
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 17
     store.add_asset(png, request_id="img")
     with pytest.raises(BoardError):
         store.add_asset(png + b"x", request_id="img")

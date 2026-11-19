@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from board.server import create_app
 from board.store import Store
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 64
 SVG = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>'
 
 

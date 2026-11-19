@@ -19,6 +19,8 @@ import contextlib
 import json
 import logging
 import signal
+import sqlite3
+import sys
 import threading
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -30,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .store import MAX_ASSET, BoardError, Store
+from .store import MAX_ASSET, BoardError, Store, check_text, loads_strict
 
 log = logging.getLogger("board.server")
 
@@ -65,6 +67,14 @@ class Locked:
 
     async def call(self, name: str, *args, **kwargs):
         return await run_in_threadpool(self._run, getattr(self.store, name), *args, **kwargs)
+
+    def _write(self, fn: Callable, *args, **kwargs):
+        with self.lock:
+            self.store.check_same_file()  # never report success for a write into a deleted DB
+            return fn(*args, **kwargs)
+
+    async def write(self, name: str, *args, **kwargs):
+        return await run_in_threadpool(self._write, getattr(self.store, name), *args, **kwargs)
 
     def close(self) -> None:
         with self.lock:
@@ -158,7 +168,19 @@ class Hub:
 
     async def _run(self) -> None:
         version = None
+        checked, replaced = 0.0, False
+        loop = asyncio.get_running_loop()
         while not self.stopping.is_set():
+            if loop.time() - checked >= 1.0:
+                checked = loop.time()
+                try:
+                    await run_in_threadpool(self.watch.check_same_file)
+                    replaced = False
+                except BoardError as e:
+                    if not replaced:
+                        log.error("%s", e.message)
+                        print(f"board: ERROR {e.message}", file=sys.stderr, flush=True)
+                    replaced = True
             try:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.nudge.wait(), POLL_INTERVAL)
@@ -239,10 +261,12 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         async def reaper():  # close logs whose `board log` process was killed (-9)
             while True:
                 with contextlib.suppress(Exception):
-                    if await writer.call("reap_dead_logs"):
+                    if await writer.write("reap_dead_logs"):
                         hub.nudge.set()
                 await asyncio.sleep(5)
 
+        with contextlib.suppress(Exception):
+            await writer.write("sweep_orphan_assets")
         reap_task = asyncio.create_task(reaper())
         try:
             yield
@@ -250,6 +274,11 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             reap_task.cancel()
             restore()
             await hub.aclose()
+            for locked in (writer, reader):  # checkpoint the WAL on a clean shutdown
+                with contextlib.suppress(Exception):
+                    locked.close()
+            with contextlib.suppress(Exception):
+                hub.watch.close()
 
     app = FastAPI(title="board", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.hub = hub
@@ -260,6 +289,16 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @app.exception_handler(BoardError)
     async def _board_error(request: Request, exc: BoardError):
         return _err(exc.message, exc.status)
+
+    @app.exception_handler(sqlite3.Error)
+    async def _db_error(request: Request, exc: sqlite3.Error):
+        log.error("database error: %s", exc)
+        return _err(f"board database error: {exc}", 503)
+
+    @app.exception_handler(OSError)
+    async def _os_error(request: Request, exc: OSError):
+        log.error("storage error: %s", exc)
+        return _err(f"board storage error: {exc.strerror or exc}", 503)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):
@@ -281,18 +320,27 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             if len(body) > MAX_POST_BODY:
                 raise BoardError("request body is larger than 8 MB", 413)
         try:
-            data = json.loads(body or b"null")
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            raise BoardError(f"invalid JSON body: {e}")
+            text = bytes(body or b"null").decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise BoardError(f"invalid JSON body: not UTF-8 ({e})")
+        data = loads_strict(text, "invalid JSON body")
         if not isinstance(data, dict):
             raise BoardError("request body must be a JSON object")
         return data
+
+    def opt_bool(d: dict, name: str) -> bool:
+        v = d.get(name, False)
+        if v is None:
+            return False
+        if not isinstance(v, bool):
+            raise BoardError(f"{name} must be true or false")
+        return v
 
     def opt_str(d: dict, name: str) -> str | None:
         v = d.get(name)
         if v is not None and not isinstance(v, str):
             raise BoardError(f"{name} must be a string")
-        return v
+        return check_text(v, name)
 
     # ------------------------------------------------------------------ REST
 
@@ -304,7 +352,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         if not isinstance(d["kind"], str):
             raise BoardError("kind must be a string")
         agent = opt_str(d, "agent")
-        post, created = await writer.call(
+        post, created = await writer.write(
             "create_post",
             agent,
             d["kind"],
@@ -312,7 +360,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             title=opt_str(d, "title"),
             status=opt_str(d, "status"),
             key=opt_str(d, "key"),
-            live=bool(d.get("live", False)),
+            live=opt_bool(d, "live"),
             request_id=opt_str(d, "request_id"),
         )
         hub.nudge.set()
@@ -324,15 +372,15 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         exit_code = d.get("exit_code")
         if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
             raise BoardError("exit_code must be an integer")
-        res = await writer.call(
+        res = await writer.write(
             "append",
             post_id,
             text=opt_str(d, "text"),
             status=opt_str(d, "status"),
             title=opt_str(d, "title"),
-            done=bool(d.get("done", False)),
+            done=opt_bool(d, "done"),
             exit_code=exit_code,
-            newline=bool(d.get("newline", False)),
+            newline=opt_bool(d, "newline"),
             expect_kind=opt_str(d, "expect_kind"),
             expect_gen=opt_str(d, "expect_gen"),
             request_id=opt_str(d, "request_id"),
@@ -346,7 +394,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         action = d.get("action")
         if not isinstance(action, str) or action not in ("approve", "reject", "answer"):
             raise BoardError("action must be approve, reject or answer")
-        post = await writer.call(
+        post = await writer.write(
             "reply", post_id, action, text=opt_str(d, "text"), request_id=opt_str(d, "request_id"),
             expect_gen=opt_str(d, "expect_gen"),
         )
@@ -369,7 +417,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         rid = rid if isinstance(rid, str) and rid else request.headers.get("x-request-id")
         data = await f.read()
         await form.close()
-        info = await writer.call("add_asset", data, request_id=rid or None)
+        info = await writer.write("add_asset", data, request_id=rid or None)
         return JSONResponse(info, status_code=201)
 
     @app.get("/api/posts")
@@ -401,6 +449,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             resume = int(raw) if raw not in (None, "") else None
         except ValueError:
             raise BoardError("Last-Event-ID / since must be an integer")
+        if resume is not None:
+            resume = max(-1, min(resume, 2**62))  # out of range -> reset below, never an overflow
         sub = hub.subscribe()  # FIRST, so nothing committed from now on can be missed
 
         async def stream() -> AsyncIterator[bytes]:
@@ -410,12 +460,14 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 last = current if resume is None else resume
                 if resume is not None:
                     lowest = await reader.call("min_event_id")
-                    if resume > current or (lowest and resume < lowest - 1):
+                    if resume > current or resume < 0 or (lowest and resume < lowest - 1):
                         yield sse_frame("reset", {"seq": current})
                         last = current
-                while True:  # replay what the client missed, in batches
+                while not hub.stopping.is_set():  # replay what the client missed, in batches
                     batch = await reader.call("events_after", last, REPLAY_BATCH)
                     for e in batch:
+                        if hub.stopping.is_set():
+                            return
                         last = e["id"]
                         yield sse_frame(e["type"], e["data"], e["id"])
                     if len(batch) < REPLAY_BATCH:
@@ -433,6 +485,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                         continue
                     last = eid
                     yield frame
+            except asyncio.CancelledError:  # server shutting down mid-stream: end quietly
+                return
             finally:
                 hub.unsubscribe(sub)
 

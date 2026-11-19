@@ -86,7 +86,7 @@ def test_normalize_table_shapes():
 
 
 def test_sniff_and_ansi():
-    assert sniff_image(b"\x89PNG\r\n\x1a\n...") == "image/png"
+    assert sniff_image(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 17) == "image/png"
     assert sniff_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>") == "image/svg+xml"
     with pytest.raises(BoardError) as e:
         sniff_image(b"hello")
@@ -210,7 +210,7 @@ def test_reply_same_request_id_returns_first_result(store):
 
 
 def test_add_asset_same_request_id_once(store):
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 17
     a = store.add_asset(png, request_id="img")
     assert store.add_asset(png, request_id="img") == a
     assert store.conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
