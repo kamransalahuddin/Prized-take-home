@@ -166,7 +166,14 @@ class LocalBackend:
         db = d.expanduser() / "board.db"
         # A read command on a database this user cannot write still works (read-only).
         ro = read_only and db.is_file() and not (os.access(db, os.W_OK) and os.access(db.parent, os.W_OK))
-        self.store = Store(d, readonly=ro)
+        try:
+            self.store = Store(d, readonly=ro)
+        except Exception:
+            # A full disk can stop even a read-write open (no room for -wal/-shm): read commands
+            # still work read-only so the board can be inspected.
+            if not read_only or ro or not db.is_file():
+                raise
+            self.store = Store(d, readonly=True)
 
     def create_post(self, patience: float | None = None, **kw) -> tuple[dict, bool]:
         return self.store.create_post(**kw)
@@ -1439,8 +1446,10 @@ def run(args: list[str]) -> int:
         warn(e.message)
         return 3
     except ServerError as e:
+        # 503 storage/lock errors mean the server refused the write (nothing was applied).
+        refused = e.status == 503 and any(w in e.message for w in ("storage error", "database error", "locked"))
         hint = (f"; the write may already have been applied (request id {e.request_id}): check with "
-                "board ls before repeating it") if e.request_id else ""
+                "board ls before repeating it") if e.request_id and not refused else ""
         warn(f"the board server failed: {e.message}{hint}")
         return 1
     except MaybeApplied as e:
