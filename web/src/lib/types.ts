@@ -14,6 +14,7 @@ export interface Post {
   created_at: string
   updated_at: string
   seq: number
+  gen?: string // changes on create and every --key replace (reply sends it as expect_gen)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   payload: Record<string, any>
 }

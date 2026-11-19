@@ -1,5 +1,5 @@
 import { AgentName } from "./agent-name"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { TextAnimate } from "./magicui/text-animate"
 import { InteractiveHoverButton } from "./magicui/interactive-hover-button"
 import { TweetCard } from "./magicui/tweet-card"
@@ -41,16 +41,23 @@ function Reply({ post }: { post: Post }) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
   const [sent, setSent] = useState("")
+  // One request id per distinct reply: retrying the same click after a network error reuses
+  // it, so the server applies the answer at most once (§4 request_id).
+  const attempt = useRef<{ key: string; id: string } | null>(null)
   async function submit(action: string) {
     setPending(true)
     setError("")
+    const body = { action, text: text.trim() || null, expect_gen: post.gen }
+    const key = JSON.stringify(body)
+    if (attempt.current?.key !== key)
+      attempt.current = { key, id: crypto.randomUUID?.() ?? String(Math.random()).slice(2) + Date.now() }
     try {
-      const response = await fetch("/api/posts/" + post.id + "/reply", {
+      const response = await fetch("/api/posts/" + encodeURIComponent(post.id) + "/reply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, text: text.trim() || null }),
+        body: JSON.stringify({ ...body, request_id: attempt.current.id }),
       })
-      const data = await response.json()
+      const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.error || "Could not send reply")
       setSent("Reply sent")
     } catch (e) {

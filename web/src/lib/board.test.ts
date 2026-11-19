@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { applyEvent, applySnapshot, dropPending, emptyState, sortedPosts, type AppendData, type MergeState } from "./board"
+import { applyEvent, applySnapshot, dropPending, emptyState, keepLastCodePoints, sortedPosts, type AppendData, type MergeState } from "./board"
 import type { Post } from "./types"
 
 function mk(id: string, seq: number, extra: Partial<Post> = {}): Post {
@@ -162,5 +162,63 @@ describe("reset and snapshot", () => {
       mk("c", 3, { updated_at: "2026-11-18T10:00:02.000Z" }),
     )
     expect(sortedPosts(st).map((p) => p.id)).toEqual(["b", "c", "a"])
+  })
+})
+
+describe("wiring against the hardened server", () => {
+  it("a post fetched on its own never moves the stream cursor", () => {
+    let s = applySnapshot(emptyState(), { posts: [mk("a", 3)], seq: 3, epoch: "e1" })
+    // append for an unknown post at seq 4 -> buffered, fetch requested
+    let r = applyEvent(s, "append", app("x", 4, "hi\n"))
+    expect(r.effect).toEqual({ type: "fetch", id: "x" })
+    s = r.state
+    expect(s.seq).toBe(4)
+    // the fetched copy is already at seq 9 (other events for it happened since)
+    s = applyEvent(s, "fetched", mk("x", 9, { payload: { text: "full\n" } })).state
+    expect(s.posts.x.seq).toBe(9)
+    expect(s.seq).toBe(4) // events 5..8 for other posts must still be applied
+    r = applyEvent(s, "append", app("a", 5, "b\n"))
+    expect(r.state.posts.a.payload.text).toBe("a\nb\n")
+  })
+
+  it("a snapshot from another database (epoch) replaces everything", () => {
+    let s = applySnapshot(emptyState(), { posts: [mk("old", 50)], seq: 50, epoch: "e1" })
+    s = applySnapshot(s, { posts: [mk("new", 2)], seq: 2, epoch: "e2" })
+    expect(Object.keys(s.posts)).toEqual(["new"])
+    expect(s.seq).toBe(2)
+    expect(s.epoch).toBe("e2")
+  })
+
+  it("hello with a different epoch asks for a fresh snapshot", () => {
+    const s = applySnapshot(emptyState(), { posts: [mk("old", 5)], seq: 5, epoch: "e1" })
+    const r = applyEvent(s, "hello", { seq: 1, epoch: "e2" })
+    expect(r.effect).toEqual({ type: "refetch" })
+    const st = applySnapshot(r.state, { posts: [mk("n", 1)], seq: 1, epoch: "e2" })
+    expect(Object.keys(st.posts)).toEqual(["n"])
+    // same epoch: nothing to do
+    expect(applyEvent(s, "hello", { seq: 5, epoch: "e1" }).effect).toBeNull()
+  })
+
+  it("reset carries the epoch", () => {
+    const s = applySnapshot(emptyState(), { posts: [mk("a", 5)], seq: 5, epoch: "e1" })
+    const r = applyEvent(s, "reset", { seq: 1, epoch: "e9" })
+    expect(r.state.epoch).toBe("e9")
+    expect(r.effect).toEqual({ type: "refetch" })
+  })
+
+  it("status-only append (empty text) updates status without touching text", () => {
+    const s = seeded(mk("a", 1))
+    const p = applyEvent(s, "append", app("a", 2, "", { status: "error", live: false, exit_code: 3 })).state.posts.a
+    expect(p.payload.text).toBe("a\n")
+    expect(p.status).toBe("error")
+    expect(p.live).toBe(false)
+    expect(p.payload.exit_code).toBe(3)
+  })
+
+  it("log truncation keeps the last 2,000,000 code points, never splitting emoji", () => {
+    expect(keepLastCodePoints("abc", 5)).toBe("abc")
+    expect(keepLastCodePoints("abcdef", 3)).toBe("def")
+    expect(keepLastCodePoints("a😀b😀", 3)).toBe("😀b😀")
+    expect(keepLastCodePoints("😀😀😀", 2)).toBe("😀😀")
   })
 })

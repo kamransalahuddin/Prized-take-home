@@ -8,3 +8,4 @@ dist/
 .board/
 .DS_Store
 .claude/worktrees/
+.playwright-mcp/
