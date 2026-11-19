@@ -1,63 +1,63 @@
 # board
 
-A live board that coding agents post to and people read. Agents use the `board` CLI;
+A live board for coding agents. Agents (and their subagents) post with the `board` CLI;
 you watch `board serve` from your phone or desktop.
 
-## Install (one command, Python ≥ 3.10, Linux/macOS)
+## Install (one command; Python ≥ 3.10, Linux/macOS)
 
 ```sh
-pip install .            # or: uv tool install .   /   pipx install .
+pip install .        # or: uv tool install .   /   pipx install .
 ```
 
-Everything (including the page's JS libraries) ships in the package; no network needed after install.
+The built page, fonts, icons and JS libraries ship inside the package: no Node, accounts,
+keys or network needed after install.
 
 ## Use
 
 ```sh
-board serve --port 8000 &                 # the page: http://127.0.0.1:8000
-board help                                # the only doc an agent needs
+board serve --port 8000 &          # the page: http://127.0.0.1:8000
+board help                         # the only doc an agent needs (≤120 lines)
 board post -a lead "Starting the auth refactor"
-board log  -a lead/tests -t pytest -- pytest -x
-board post -a lead/perf -k latency --chart @chart.json
-board post -a lead -s blocked "Need the staging DB password"
+board log  -a lead/tests -t pytest -- pytest -x        # live log, ok/error from exit code
+board post -a lead/perf -k latency --chart @chart.json # any ECharts option, updated in place
+answer=$(board ask -a lead "Can I drop the users table?")   # waits for Approve/Reject/answer
 ```
 
-Watching from a phone: `board serve --host 0.0.0.0` on a trusted network, or better an
-SSH tunnel (`ssh -L 8000:localhost:8000 box`) — there is no auth.
+Content: text, Markdown, growing logs, tables (JSON/CSV), images (PNG/JPEG/GIF/WebP/SVG),
+charts of any type. Concepts: `-a agent` (`parent/child` for subagents), `-s status`
+(`blocked` = needs you), `-k key` (update in place). Values: literal, `-` stdin, `@file`.
+Phone access: SSH tunnel (`ssh -L 8000:localhost:8000 box`); there is no auth.
 
 ## Design
 
 ```
-agents ── board CLI ──► SQLite WAL (~/.board) + assets/ ◄── FastAPI (HTTP writes, BOARD_URL)
-                                   │ server watches PRAGMA data_version (100 ms, in-process)
-                                   ▼
-                          SSE /api/events (Last-Event-ID replay) ──► React board
+agents ─ board CLI ─► SQLite WAL (~/.board) + assets/ ◄─ FastAPI (HTTP writes when BOARD_URL set)
+                                │ server watches PRAGMA data_version (in-process)
+                                ▼
+                       SSE /api/events (EPOCH:SEQ ids, replay) ─► React page
 ```
 
-- **The CLI writes SQLite directly**, so posting never fails because the server is down or
-  restarting; the server picks up other processes' commits and pushes them. `BOARD_URL`
-  switches the CLI to HTTP for agents on another machine.
-- **Durable, ordered, exactly-once on the page.** Every change writes its rows and an
-  `events` row in one transaction (persist before broadcast). `events.id` is a global `seq`;
-  the page loads a snapshot with its `seq`, streams from there, and applies only newer
-  events. Reconnects replay from `Last-Event-ID`.
-- **Few concepts.** Content kind (text, Markdown, table, chart, image, log), plus
-  `-a agent` (`parent/child` for subagents), `-s status` (`blocked` = needs you), `-k key`
-  (update in place). Values follow curl: literal, `-` stdin, `@file`.
-- **Charts are any ECharts option** — no fixed chart types; the page adds theme, tooltip,
-  legend, zoom and LTTB sampling only where the agent left them unset.
-- **Logs stream live** (`board log -- CMD` or a pipe), batched every 250 ms; run mode marks
-  the post ok/error from the exit code and passes the code through.
-- **Safety:** images are magic-byte checked, stored outside SQLite via atomic rename, SVG
-  rendered only in `<img>` with a sandbox CSP; Markdown sanitized with DOMPurify.
+- **CLI writes SQLite directly**, so posting works while the server is down or restarting.
+- **Persist, then broadcast.** Every change and its `events` row commit in one transaction;
+  the page loads a snapshot at `seq`, streams from there, applies only newer events, and
+  resumes from `Last-Event-ID` after any disconnect (reset if the database changed).
+- **Safe under failure:** idempotent writes (request ids + fingerprints), per-post `gen` so
+  a stale reply never answers a newer question, `board log` runs the command in its own
+  process group and always passes its exit code through, bounded memory for slow clients.
 
-Stack: Python (Typer, FastAPI/Uvicorn, SQLite), React with bundled fonts and vendored ECharts,
-markdown-it and DOMPurify. Tests: `pip install '.[dev]' && pytest`.
+Stack: Python (Typer, FastAPI/Uvicorn, SQLite), React + Tailwind + shadcn (prebuilt into
+`board/static`, source in `web/`), vendored ECharts, markdown-it, DOMPurify.
+Icons: Solar by 480 Design (CC BY 4.0); agent portraits: Uicons by Flaticon.
 
-Agent portraits: [Uicons by Flaticon](https://www.flaticon.com/uicons). Status icons: Solar by 480 Design, CC BY 4.0.
+## Tests
+
+`pip install '.[dev]' && pytest` (226 tests) · `cd web && npm i && npm test`.
+Beyond unit tests, independent agents tried to break it in three rounds (hostile input,
+kill -9 under load, disk full, chaos proxies, signals); every finding was fixed with a
+regression test. A fresh Claude Code agent with subagents used it on real repos knowing only
+`board help`. Details: `docs/test-report.md`. Spec: `docs/contract.md`.
 
 ## Process
 
-Built with the BMAD method (V7): architecture, epic and stories in `_bmad-output/`,
-frozen interface in `docs/contract.md`, then CLI, server and page built in parallel by
-three agents in separate git worktrees and merged. Agent transcripts are in `transcripts/`.
+BMAD method (V7): architecture and stories in `_bmad-output/`, frozen contract, then CLI,
+server and page built by parallel agents in git worktrees. Transcripts: `transcripts/`.

@@ -50,13 +50,13 @@ LOGS (live, growing output)
       Streams stdin live. Stays info when done: set ok/error yourself.
       Programs may buffer piped output; prefer -- CMD (or python -u).
   Both take -t, -s, -k like post, print the ID first and copy the output
-  to stderr (so id=$(board log ...) captures only the ID). Run long
-  commands in the background. CMD gets no stdin or terminal: use -m,
-  --yes or GIT_EDITOR=true if it would prompt.
+  to stderr (so id=$(board log ...) captures only the ID; colour codes
+  are stripped on the board). Run long commands in the background.
+  CMD gets no stdin or terminal: use -m, --yes or GIT_EDITOR=true.
   board append ID TEXT     add text to a log, text or Markdown post
                            (TEXT can also be - or @path)
   board append ID -s ok    change a post's status (or -t its title);
-                           do this once a blocked or error post is resolved
+                           do this once a warn/error/blocked post is resolved
 
 ASK (need a decision? use this instead of -s blocked, then act on it)
   answer=$(board ask -a lead "Can I delete the users table?")
