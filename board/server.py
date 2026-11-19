@@ -18,7 +18,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import signal
+import sqlite3
+import sys
 import threading
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -30,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .store import MAX_ASSET, BoardError, Store
+from .store import MAX_ASSET, BoardError, Store, check_text, loads_strict
 
 log = logging.getLogger("board.server")
 
@@ -39,7 +42,11 @@ MAX_POST_BODY = 8 * 1024 * 1024
 POLL_INTERVAL = 0.1
 PING_INTERVAL = 15.0
 QUEUE_MAX = 5000  # events buffered per SSE client before it is dropped (it reconnects + replays)
+QUEUE_MAX_BYTES = 8 * 1024 * 1024  # ... or this many bytes of frames
 REPLAY_BATCH = 500
+BATCH_BYTES = 1024 * 1024  # replay / watcher read at most ~this much event data at a time
+SEND_TIMEOUT = 30.0  # a client that doesn't take a frame for this long is cut off
+RESUME_RE = re.compile(r"^(?:([0-9a-f]{1,32}):)?([0-9]{1,18})$", re.ASCII)
 
 ASSET_HEADERS = {
     "Cache-Control": "public, max-age=31536000, immutable",
@@ -66,26 +73,127 @@ class Locked:
     async def call(self, name: str, *args, **kwargs):
         return await run_in_threadpool(self._run, getattr(self.store, name), *args, **kwargs)
 
+    def _write(self, fn: Callable, *args, **kwargs):
+        with self.lock:
+            self.store.check_same_file()  # never report success for a write into a deleted DB
+            return fn(*args, **kwargs)
+
+    async def write(self, name: str, *args, **kwargs):
+        return await run_in_threadpool(self._write, getattr(self.store, name), *args, **kwargs)
+
     def close(self) -> None:
         with self.lock:
             self.store.close()
 
 
-def sse_frame(event: str, data: Any, eid: int | None = None) -> bytes:
+class StalledClient(OSError):
+    """An SSE client did not accept a frame within SEND_TIMEOUT."""
+
+
+def _find_transport(send: Any) -> Any:
+    """The asyncio transport behind an ASGI `send` (uvicorn's cycle object holds it, under a
+    few layers of middleware closures), or None. Used to abort - not gracefully close - a
+    connection whose peer stopped reading: close() would wait forever to flush."""
+    seen, todo = set(), [send]
+    while todo and len(seen) < 200:
+        obj = todo.pop()
+        if id(obj) in seen or obj is None:
+            continue
+        seen.add(id(obj))
+        t = getattr(obj, "transport", None)
+        if t is not None and hasattr(t, "abort"):
+            return t
+        todo.append(getattr(obj, "__self__", None))
+        todo.append(getattr(obj, "func", None))  # functools.partial
+        for cell in getattr(obj, "__closure__", None) or ():
+            with contextlib.suppress(ValueError):
+                if callable(cell.cell_contents) or hasattr(cell.cell_contents, "transport"):
+                    todo.append(cell.cell_contents)
+    return None
+
+
+class SSEResponse(StreamingResponse):
+    """StreamingResponse with a timeout on every send: a client that stops reading (or a
+    half-open connection) is cut off instead of holding the generator and its memory.
+    A send blocked on such a client also ends when the server shuts down (`stop`)."""
+
+    def __init__(self, content, stop: asyncio.Event, **kw):
+        super().__init__(content, **kw)
+        self.stop = stop
+
+    async def stream_response(self, send) -> None:
+        stopper = asyncio.ensure_future(self.stop.wait())
+
+        async def timed(message):
+            task = asyncio.ensure_future(send(message))
+            done, _ = await asyncio.wait({task, stopper}, timeout=SEND_TIMEOUT,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if task not in done:
+                task.cancel()
+                transport = _find_transport(send)
+                if transport is not None:
+                    transport.abort()  # release the socket now; the peer isn't reading
+                raise StalledClient("SSE client stopped reading" if not self.stop.is_set()
+                                    else "server shutting down")
+            task.result()
+
+        try:
+            await timed({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            async for chunk in self.body_iterator:
+                await timed({"type": "http.response.body", "body": chunk, "more_body": True})
+            await timed({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            stopper.cancel()
+            with contextlib.suppress(Exception):
+                await self.body_iterator.aclose()
+
+
+class _QuietDisconnects(logging.Filter):
+    """Don't log a traceback for every SSE client we cut off (stalled / disconnected)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        while exc is not None:
+            if isinstance(exc, StalledClient) or type(exc).__name__ == "ClientDisconnect":
+                return False
+            exc = exc.__cause__ or exc.__context__
+        return True
+
+
+logging.getLogger("uvicorn.error").addFilter(_QuietDisconnects())
+
+
+def sse_frame(event: str, data: Any, eid: int | str | None = None) -> bytes:
     head = f"id: {eid}\n" if eid is not None else ""
     return f"{head}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
 class Subscriber:
     def __init__(self) -> None:
-        # Unbounded so a close sentinel always fits; the bound is enforced in Hub.publish.
+        # Unbounded so a close sentinel always fits; the bounds (frames and bytes) are
+        # enforced in Hub.publish.
         self.queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
+        self.bytes = 0
         self.closed = False
 
     def close(self) -> None:
         if not self.closed:
             self.closed = True
             self.queue.put_nowait(None)
+
+    def drop(self) -> None:
+        """Too slow: free the buffered frames now and end the stream (it reconnects and
+        replays from its Last-Event-ID)."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.bytes = 0
+        self.closed = False
+        self.close()
+
+    def get_nowait_frame(self, item):
+        if item is not None:
+            self.bytes -= len(item[1])
+        return item
 
 
 class Hub:
@@ -105,6 +213,7 @@ class Hub:
         self.nudge = asyncio.Event()
         self.loop = asyncio.get_running_loop()
         self.last_seq = await run_in_threadpool(self.watch.current_seq)
+        self.epoch = self.watch.epoch
         self._task = asyncio.create_task(self._run(), name="board-watcher")
 
     def stop(self) -> None:
@@ -139,26 +248,33 @@ class Hub:
 
     def publish(self, eid: int, frame: bytes) -> None:
         for sub in list(self.subs):
-            if sub.queue.qsize() >= QUEUE_MAX:
+            if sub.closed:
+                self.subs.discard(sub)
+            elif sub.queue.qsize() >= QUEUE_MAX or sub.bytes + len(frame) > QUEUE_MAX_BYTES:
                 log.warning("dropping slow SSE client (queue full)")
                 self.subs.discard(sub)
-                sub.close()
+                sub.drop()
             else:
+                sub.bytes += len(frame)
                 sub.queue.put_nowait((eid, frame))
 
-    def _read_new(self) -> list[dict]:
-        out: list[dict] = []
-        seq = self.last_seq
-        while True:
-            batch = self.watch.events_after(seq, 1000)
-            out += batch
-            if len(batch) < 1000:
-                return out
-            seq = batch[-1]["id"]
+    def frame(self, e: dict) -> bytes:
+        return sse_frame(e["type"], e["data"], f"{self.epoch}:{e['id']}")
 
     async def _run(self) -> None:
         version = None
+        checked, replaced = 0.0, False
+        loop = asyncio.get_running_loop()
         while not self.stopping.is_set():
+            if loop.time() - checked >= 1.0:
+                checked = loop.time()
+                try:
+                    await run_in_threadpool(self.watch.check_same_file)
+                    replaced = False
+                except BoardError as e:
+                    if not replaced:
+                        print(f"board: ERROR {e.message}", file=sys.stderr, flush=True)
+                    replaced = True
             try:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.nudge.wait(), POLL_INTERVAL)
@@ -167,11 +283,15 @@ class Hub:
                 if v == version:
                     continue
                 version = v  # read before the events: a commit in between bumps it again
-                for e in await run_in_threadpool(self._read_new):
-                    if e["id"] <= self.last_seq:
-                        continue
-                    self.last_seq = e["id"]
-                    self.publish(e["id"], sse_frame(e["type"], e["data"], e["id"]))
+                while True:  # in byte-bounded batches, publishing as we go
+                    batch = await run_in_threadpool(self.watch.events_after, self.last_seq, 1000, BATCH_BYTES)
+                    if not batch:
+                        break
+                    for e in batch:
+                        if e["id"] <= self.last_seq:
+                            continue
+                        self.last_seq = e["id"]
+                        self.publish(e["id"], self.frame(e))
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep watching; the next poll retries
@@ -239,10 +359,12 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         async def reaper():  # close logs whose `board log` process was killed (-9)
             while True:
                 with contextlib.suppress(Exception):
-                    if await writer.call("reap_dead_logs"):
+                    if await writer.write("reap_dead_logs"):
                         hub.nudge.set()
                 await asyncio.sleep(5)
 
+        with contextlib.suppress(Exception):
+            await writer.write("sweep_orphan_assets")
         reap_task = asyncio.create_task(reaper())
         try:
             yield
@@ -250,6 +372,11 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             reap_task.cancel()
             restore()
             await hub.aclose()
+            for locked in (writer, reader):  # checkpoint the WAL on a clean shutdown
+                with contextlib.suppress(Exception):
+                    locked.close()
+            with contextlib.suppress(Exception):
+                hub.watch.close()
 
     app = FastAPI(title="board", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.hub = hub
@@ -260,6 +387,16 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @app.exception_handler(BoardError)
     async def _board_error(request: Request, exc: BoardError):
         return _err(exc.message, exc.status)
+
+    @app.exception_handler(sqlite3.Error)
+    async def _db_error(request: Request, exc: sqlite3.Error):
+        log.error("database error: %s", exc)
+        return _err(f"board database error: {exc}", 503)
+
+    @app.exception_handler(OSError)
+    async def _os_error(request: Request, exc: OSError):
+        log.error("storage error: %s", exc)
+        return _err(f"board storage error: {exc.strerror or exc}", 503)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):
@@ -281,18 +418,27 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             if len(body) > MAX_POST_BODY:
                 raise BoardError("request body is larger than 8 MB", 413)
         try:
-            data = json.loads(body or b"null")
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            raise BoardError(f"invalid JSON body: {e}")
+            text = bytes(body or b"null").decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise BoardError(f"invalid JSON body: not UTF-8 ({e})")
+        data = loads_strict(text, "invalid JSON body")
         if not isinstance(data, dict):
             raise BoardError("request body must be a JSON object")
         return data
+
+    def opt_bool(d: dict, name: str) -> bool:
+        v = d.get(name, False)
+        if v is None:
+            return False
+        if not isinstance(v, bool):
+            raise BoardError(f"{name} must be true or false")
+        return v
 
     def opt_str(d: dict, name: str) -> str | None:
         v = d.get(name)
         if v is not None and not isinstance(v, str):
             raise BoardError(f"{name} must be a string")
-        return v
+        return check_text(v, name)
 
     # ------------------------------------------------------------------ REST
 
@@ -304,7 +450,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         if not isinstance(d["kind"], str):
             raise BoardError("kind must be a string")
         agent = opt_str(d, "agent")
-        post, created = await writer.call(
+        post, created = await writer.write(
             "create_post",
             agent,
             d["kind"],
@@ -312,7 +458,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             title=opt_str(d, "title"),
             status=opt_str(d, "status"),
             key=opt_str(d, "key"),
-            live=bool(d.get("live", False)),
+            live=opt_bool(d, "live"),
             request_id=opt_str(d, "request_id"),
         )
         hub.nudge.set()
@@ -324,16 +470,17 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         exit_code = d.get("exit_code")
         if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
             raise BoardError("exit_code must be an integer")
-        res = await writer.call(
+        res = await writer.write(
             "append",
             post_id,
             text=opt_str(d, "text"),
             status=opt_str(d, "status"),
             title=opt_str(d, "title"),
-            done=bool(d.get("done", False)),
+            done=opt_bool(d, "done"),
             exit_code=exit_code,
-            newline=bool(d.get("newline", False)),
+            newline=opt_bool(d, "newline"),
             expect_kind=opt_str(d, "expect_kind"),
+            expect_gen=opt_str(d, "expect_gen"),
             request_id=opt_str(d, "request_id"),
         )
         hub.nudge.set()
@@ -345,8 +492,9 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         action = d.get("action")
         if not isinstance(action, str) or action not in ("approve", "reject", "answer"):
             raise BoardError("action must be approve, reject or answer")
-        post = await writer.call(
-            "reply", post_id, action, text=opt_str(d, "text"), request_id=opt_str(d, "request_id")
+        post = await writer.write(
+            "reply", post_id, action, text=opt_str(d, "text"), request_id=opt_str(d, "request_id"),
+            expect_gen=opt_str(d, "expect_gen"),
         )
         hub.nudge.set()
         return post
@@ -367,7 +515,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         rid = rid if isinstance(rid, str) and rid else request.headers.get("x-request-id")
         data = await f.read()
         await form.close()
-        info = await writer.call("add_asset", data, request_id=rid or None)
+        info = await writer.write("add_asset", data, request_id=rid or None)
         return JSONResponse(info, status_code=201)
 
     @app.get("/api/posts")
@@ -377,7 +525,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         except ValueError:
             raise BoardError("limit must be an integer")
         posts, seq = await reader.call("list_posts", agent=agent or None, limit=n)
-        return JSONResponse({"posts": posts, "seq": seq}, headers={"X-Board-Data": str(reader.store.dir)})
+        return JSONResponse({"posts": posts, "seq": seq, "epoch": reader.store.epoch},
+                            headers={"X-Board-Data": str(reader.store.dir)})
 
     @app.get("/api/posts/{post_id}")
     async def get_post(post_id: str):
@@ -395,35 +544,46 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @app.get("/api/events")
     async def events(request: Request, since: str | None = None):
         raw = request.headers.get("last-event-id") or since
-        try:
-            resume = int(raw) if raw not in (None, "") else None
-        except ValueError:
-            raise BoardError("Last-Event-ID / since must be an integer")
+        resume, epoch = None, reader.store.epoch
+        if raw not in (None, ""):
+            m = RESUME_RE.match(raw.strip())
+            if not m:
+                raise BoardError("Last-Event-ID / since must be SEQ or EPOCH:SEQ (ASCII digits)")
+            resume = int(m.group(2))
+            if m.group(1) is not None and m.group(1) != epoch:
+                resume = -1  # another database (wiped, replaced, other --data): reset
         sub = hub.subscribe()  # FIRST, so nothing committed from now on can be missed
 
         async def stream() -> AsyncIterator[bytes]:
+            loop = asyncio.get_running_loop()
             try:
                 current = await reader.call("current_seq")
-                yield b"retry: 1000\n\n" + sse_frame("hello", {"seq": current})
+                yield b"retry: 1000\n\n" + sse_frame("hello", {"seq": current, "epoch": epoch})
                 last = current if resume is None else resume
                 if resume is not None:
                     lowest = await reader.call("min_event_id")
-                    if resume > current or (lowest and resume < lowest - 1):
-                        yield sse_frame("reset", {"seq": current})
+                    if resume > current or resume < 0 or (lowest and resume < lowest - 1):
+                        yield sse_frame("reset", {"seq": current, "epoch": epoch})
                         last = current
-                while True:  # replay what the client missed, in batches
-                    batch = await reader.call("events_after", last, REPLAY_BATCH)
-                    for e in batch:
-                        last = e["id"]
-                        yield sse_frame(e["type"], e["data"], e["id"])
-                    if len(batch) < REPLAY_BATCH:
+                while not hub.stopping.is_set():  # replay what the client missed, in batches
+                    batch = await reader.call("events_after", last, REPLAY_BATCH, BATCH_BYTES)
+                    if not batch:
                         break
-                while True:  # live
-                    try:
-                        item = await asyncio.wait_for(sub.queue.get(), PING_INTERVAL)
-                    except asyncio.TimeoutError:
+                    for e in batch:
+                        if hub.stopping.is_set():
+                            return
+                        last = e["id"]
+                        yield hub.frame(e)
+                next_ping = loop.time() + PING_INTERVAL
+                while not sub.closed or not sub.queue.empty():  # live
+                    if loop.time() >= next_ping:  # on a timer, busy or not: detects dead peers
                         yield b": ping\n\n"
+                        next_ping = loop.time() + PING_INTERVAL
+                    try:
+                        item = await asyncio.wait_for(sub.queue.get(), max(0.0, next_ping - loop.time()))
+                    except asyncio.TimeoutError:
                         continue
+                    item = sub.get_nowait_frame(item)
                     if item is None:  # shutdown or dropped as too slow: client reconnects
                         return
                     eid, frame = item
@@ -431,10 +591,13 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                         continue
                     last = eid
                     yield frame
+            except asyncio.CancelledError:  # server shutting down mid-stream: end quietly
+                return
             finally:
                 hub.unsubscribe(sub)
+                sub.drop()
 
-        return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+        return SSEResponse(stream(), hub.stopping, media_type="text/event-stream", headers=SSE_HEADERS)
 
     # ------------------------------------------------------------------ page
 

@@ -54,9 +54,9 @@ def test_append_events(store):
     store.append(lg["id"], "chunk")
     store.append(lg["id"], status="warn")
     evs = store.events_after(lg["seq"])
-    assert [e["type"] for e in evs] == ["append", "post"]
+    assert [e["type"] for e in evs] == ["append", "append"]  # status-only change: small append, text ""
     assert evs[0]["data"]["text"] == "chunk" and evs[0]["data"]["seq"] == evs[0]["id"]
-    assert evs[1]["data"]["status"] == "warn"
+    assert evs[1]["data"]["status"] == "warn" and evs[1]["data"]["text"] == ""
 
 
 def test_log_cap_truncates(store):
@@ -86,7 +86,7 @@ def test_normalize_table_shapes():
 
 
 def test_sniff_and_ansi():
-    assert sniff_image(b"\x89PNG\r\n\x1a\n...") == "image/png"
+    assert sniff_image(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 17) == "image/png"
     assert sniff_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>") == "image/svg+xml"
     with pytest.raises(BoardError) as e:
         sniff_image(b"hello")
@@ -210,7 +210,7 @@ def test_reply_same_request_id_returns_first_result(store):
 
 
 def test_add_asset_same_request_id_once(store):
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 17
     a = store.add_asset(png, request_id="img")
     assert store.add_asset(png, request_id="img") == a
     assert store.conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
@@ -222,7 +222,7 @@ def test_request_id_reused_for_other_op_and_pruning(store):
     with pytest.raises(BoardError) as e:
         store.append(p["id"], text="x", request_id="same")
     assert e.value.status == 409
-    store.conn.execute("INSERT INTO requests VALUES ('old', '{}', '2000-01-01T00:00:00.000Z')")
+    store.conn.execute("INSERT INTO requests(id, result, created_at) VALUES ('old', '{}', '2000-01-01T00:00:00.000Z')")
     store.append(p["id"], text="x", request_id="new")
     ids = {r[0] for r in store.conn.execute("SELECT id FROM requests")}
     assert ids == {"same", "new"}

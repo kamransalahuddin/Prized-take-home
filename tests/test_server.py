@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from board.server import create_app
 from board.store import Store
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 64
 SVG = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>'
 
 
@@ -208,7 +208,8 @@ class SSE:
                     elif k == "data":
                         ev["data"] = json.loads(v)
                     elif k == "id":
-                        ev["id"] = int(v)
+                        ev["id"] = int(v.rsplit(":", 1)[-1])
+                        ev["eid"] = v
                     else:
                         ev[k] = v
         except Exception:
@@ -244,7 +245,7 @@ def test_sse_headers_and_hello(live):
         assert s.resp.headers["cache-control"] == "no-cache"
         assert s.resp.headers["x-accel-buffering"] == "no"
         hello = s.next()
-        assert hello["event"] == "hello" and hello["data"] == {"seq": 1}
+        assert hello["event"] == "hello" and hello["data"]["seq"] == 1 and len(hello["data"]["epoch"]) == 8
         assert s.retry == 1000 and s.raw[0] == "retry: 1000"
         s.assert_quiet()  # no since → live only, nothing replayed
     finally:
@@ -380,7 +381,7 @@ def test_sse_reset_when_since_is_from_another_db(live):
     try:
         assert s.next()["event"] == "hello"
         ev = s.next()
-        assert ev["event"] == "reset" and ev["data"] == {"seq": 0}
+        assert ev["event"] == "reset" and ev["data"]["seq"] == 0
     finally:
         s.close()
 
