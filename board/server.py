@@ -334,6 +334,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             exit_code=exit_code,
             newline=bool(d.get("newline", False)),
             expect_kind=opt_str(d, "expect_kind"),
+            expect_gen=opt_str(d, "expect_gen"),
             request_id=opt_str(d, "request_id"),
         )
         hub.nudge.set()
@@ -346,7 +347,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         if not isinstance(action, str) or action not in ("approve", "reject", "answer"):
             raise BoardError("action must be approve, reject or answer")
         post = await writer.call(
-            "reply", post_id, action, text=opt_str(d, "text"), request_id=opt_str(d, "request_id")
+            "reply", post_id, action, text=opt_str(d, "text"), request_id=opt_str(d, "request_id"),
+            expect_gen=opt_str(d, "expect_gen"),
         )
         hub.nudge.set()
         return post

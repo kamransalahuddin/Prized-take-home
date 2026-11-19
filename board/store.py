@@ -11,6 +11,7 @@ Safe for many concurrent writer processes (busy_timeout + short transactions).
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -46,7 +47,8 @@ CREATE TABLE IF NOT EXISTS posts (
   live       INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  seq        INTEGER NOT NULL DEFAULT 0
+  seq        INTEGER NOT NULL DEFAULT 0,
+  gen        TEXT                    -- new random token on every create and --key replace
 );
 CREATE UNIQUE INDEX IF NOT EXISTS posts_agent_key ON posts(agent, key) WHERE key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS posts_updated ON posts(updated_at);
@@ -74,7 +76,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS requests (   -- idempotency: request_id -> stored result
   id         TEXT PRIMARY KEY,
   result     TEXT NOT NULL,          -- JSON {"op": ..., "result": ...}
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  fp         TEXT                    -- sha256 of op + normalized arguments
 );
 CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at);
 """
@@ -105,6 +108,16 @@ def check_request_id(request_id: Any) -> str | None:
     if not isinstance(request_id, str) or len(request_id) > 200:
         raise BoardError("request_id must be a string of at most 200 characters")
     return request_id
+
+
+def new_gen() -> str:
+    return secrets.token_hex(8)
+
+
+def fingerprint(op: str, args: Any) -> str:
+    """Identity of a write request: same request_id must mean the same request."""
+    raw = json.dumps([op, args], sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def new_id(prefix: str, n: int) -> str:
@@ -260,8 +273,26 @@ class Store:
         self._retry(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self._retry(lambda: self.conn.executescript(SCHEMA))
+        self._migrate()
 
     # -- plumbing
+
+    def _migrate(self) -> None:
+        """Add columns that older databases lack (posts.gen, requests.fp)."""
+        def cols(c, table):
+            return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+        if "gen" in cols(self.conn, "posts") and "fp" in cols(self.conn, "requests"):
+            return
+
+        def tx(c):
+            if "gen" not in cols(c, "posts"):
+                c.execute("ALTER TABLE posts ADD COLUMN gen TEXT")
+                c.execute("UPDATE posts SET gen=lower(hex(randomblob(8))) WHERE gen IS NULL")
+            if "fp" not in cols(c, "requests"):
+                c.execute("ALTER TABLE requests ADD COLUMN fp TEXT")
+
+        self._tx(tx)
 
     def close(self) -> None:
         self.conn.close()
@@ -314,6 +345,7 @@ class Store:
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
             "seq": r["seq"],
+            "gen": r["gen"],
         }
         if with_payload:
             payload = json.loads(r["payload"])
@@ -377,30 +409,31 @@ class Store:
         c.execute("UPDATE posts SET seq=? WHERE id=?", (seq, post_id))
         return seq
 
-    def _stored(self, c: sqlite3.Connection, op: str, request_id: str | None) -> Any:
-        """The stored result of an earlier write with this request_id, or None."""
+    def _stored(self, c: sqlite3.Connection, op: str, request_id: str | None, fp: str | None = None) -> Any:
+        """The stored result of an earlier write with this request_id, or None. The same
+        id with a different request (other op, post or arguments) is a 409."""
         if request_id is None:
             return None
-        row = c.execute("SELECT result FROM requests WHERE id=?", (request_id,)).fetchone()
+        row = c.execute("SELECT result, fp FROM requests WHERE id=?", (request_id,)).fetchone()
         if not row:
             return None
         stored = json.loads(row[0])
-        if stored.get("op") != op:
-            raise BoardError("request_id was already used for a different kind of request", 409)
+        if stored.get("op") != op or (fp is not None and row[1] is not None and row[1] != fp):
+            raise BoardError("request_id was already used for a different request", 409)
         return stored
 
-    def _idem(self, c: sqlite3.Connection, op: str, request_id: str | None, fn) -> Any:
+    def _idem(self, c: sqlite3.Connection, op: str, request_id: str | None, fn, fp: str | None = None) -> Any:
         """Run `fn(c)` once per request_id (inside the caller's transaction). A retry of a
         write that already committed (response lost) returns the stored result instead of
         writing again."""
-        stored = self._stored(c, op, request_id)
+        stored = self._stored(c, op, request_id, fp)
         if stored is not None:
             return stored["result"]
         out = fn(c)
         if request_id is not None:
             c.execute(
-                "INSERT INTO requests(id, result, created_at) VALUES (?,?,?)",
-                (request_id, json.dumps({"op": op, "result": out}, ensure_ascii=False), now_iso()),
+                "INSERT INTO requests(id, result, created_at, fp) VALUES (?,?,?,?)",
+                (request_id, json.dumps({"op": op, "result": out}, ensure_ascii=False), now_iso(), fp),
             )
             c.execute("DELETE FROM requests WHERE created_at < ?", (iso_at(time.time() - REQUEST_TTL),))
         return out
@@ -438,22 +471,24 @@ class Store:
             if existing:
                 pid, created = existing[0], False
                 c.execute(
-                    "UPDATE posts SET kind=?, title=?, status=?, payload=?, live=?, updated_at=? WHERE id=?",
-                    (kind, title, status, json.dumps(payload, ensure_ascii=False), int(live), ts, pid),
+                    "UPDATE posts SET kind=?, title=?, status=?, payload=?, live=?, updated_at=?, gen=? WHERE id=?",
+                    (kind, title, status, json.dumps(payload, ensure_ascii=False), int(live), ts, new_gen(), pid),
                 )
                 c.execute("DELETE FROM log_chunks WHERE post_id=?", (pid,))
             else:
                 pid, created = new_id("p_", 6), True
                 c.execute(
-                    "INSERT INTO posts(id, agent, kind, title, status, key, payload, live, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (pid, agent, kind, title, status, key, json.dumps(payload, ensure_ascii=False), int(live), ts, ts),
+                    "INSERT INTO posts(id, agent, kind, title, status, key, payload, live, created_at, updated_at, gen)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, agent, kind, title, status, key, json.dumps(payload, ensure_ascii=False), int(live), ts, ts,
+                     new_gen()),
                 )
             post = self.get_post(pid, c)
             post["seq"] = self._event(c, "post", pid, dict(post))
             return [post, created]
 
-        post, created = self._tx(lambda c: self._idem(c, "create_post", request_id, tx))
+        fp = fingerprint("create_post", [agent, kind, payload, title, status, key, bool(live)])
+        post, created = self._tx(lambda c: self._idem(c, "create_post", request_id, tx, fp))
         return post, created
 
     def append(
@@ -467,6 +502,7 @@ class Store:
         newline: bool = False,
         expect_kind: str | None = None,
         request_id: str | None = None,
+        expect_gen: str | None = None,
     ) -> dict:
         """Append text to a log/text/markdown post and/or change status/title/live.
 
@@ -476,7 +512,8 @@ class Store:
         Emits an 'append' event when text was added, else a 'post' event (full post).
         Returns a light result {id, seq, status, title, live, updated_at, size}.
         With `request_id`, a repeat of the same request returns the first result without
-        writing (so a retried log chunk is stored exactly once)."""
+        writing (so a retried log chunk is stored exactly once). `expect_gen`: 409 if the
+        post was created again / replaced with --key since (its gen changed)."""
         request_id = check_request_id(request_id)
         if text == "":
             text = None
@@ -494,6 +531,8 @@ class Store:
             kind = r["kind"]
             if expect_kind and kind != expect_kind:
                 raise BoardError(f"post {post_id} is now a {kind} post (replaced with --key); not appending", 409)
+            if expect_gen and r["gen"] != expect_gen:
+                raise BoardError(f"post {post_id} was replaced (--key) by a newer post; not appending", 409)
             if exit_code is not None and kind != "log":
                 raise BoardError("exit_code only applies to log posts", 409)
             payload = json.loads(r["payload"])
@@ -557,13 +596,17 @@ class Store:
             return {"id": post_id, "seq": seq, "status": new_status, "title": new_title, "live": bool(live),
                     "updated_at": ts, "size": size}
 
-        return self._tx(lambda c: self._idem(c, "append", request_id, tx))
+        fp = fingerprint("append", [post_id, text, status, title, bool(done), exit_code, bool(newline),
+                                    expect_kind, expect_gen])
+        return self._tx(lambda c: self._idem(c, "append", request_id, tx, fp))
 
-    def reply(self, post_id: str, action: str, text: str | None = None, request_id: str | None = None) -> dict:
+    def reply(self, post_id: str, action: str, text: str | None = None, request_id: str | None = None,
+              expect_gen: str | None = None) -> dict:
         """The human's answer to a blocked post: approve / reject (optional note) or answer
         (text required). Sets payload.reply = {action, text, at}, status blocked -> info,
         emits a 'post' event. Only once per post, and only while it is blocked (409).
-        Returns the full post."""
+        `expect_gen` (the gen of the question the human saw): 409 if the question was
+        replaced (re-asked with --key) since. Returns the full post."""
         request_id = check_request_id(request_id)
         if not isinstance(action, str) or action not in REPLY_ACTIONS:
             raise BoardError("action must be approve, reject or answer")
@@ -580,6 +623,8 @@ class Store:
             r = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
             if not r:
                 raise BoardError(f"no post {post_id}", 404)
+            if expect_gen and r["gen"] != expect_gen:
+                raise BoardError("the question was replaced by a newer one; reload and answer that", 409)
             payload = json.loads(r["payload"])
             if payload.get("reply"):
                 raise BoardError("already answered", 409)
@@ -595,7 +640,8 @@ class Store:
             post["seq"] = self._event(c, "post", post_id, dict(post))
             return post
 
-        return self._tx(lambda c: self._idem(c, "reply", request_id, tx))
+        fp = fingerprint("reply", [post_id, action, text, expect_gen])
+        return self._tx(lambda c: self._idem(c, "reply", request_id, tx, fp))
 
     def reap_dead_logs(self) -> int:
         """Close live logs whose `board log` process (on this host) no longer exists.
@@ -627,7 +673,8 @@ class Store:
 
     def add_asset(self, data: bytes, request_id: str | None = None) -> dict:
         request_id = check_request_id(request_id)
-        stored = self._stored(self.conn, "add_asset", request_id)
+        fp = fingerprint("add_asset", hashlib.sha256(data).hexdigest())
+        stored = self._stored(self.conn, "add_asset", request_id, fp)
         if stored is not None:
             return stored["result"]
         if len(data) > MAX_ASSET:
@@ -650,7 +697,7 @@ class Store:
             )
             return {"id": aid, "mime": mime, "size": len(data), "url": f"/api/assets/{aid}"}
 
-        info = self._tx(lambda c: self._idem(c, "add_asset", request_id, tx))
+        info = self._tx(lambda c: self._idem(c, "add_asset", request_id, tx, fp))
         if info["id"] != aid:  # a concurrent duplicate of this request won the race
             try:
                 (self.assets_dir / filename).unlink()
