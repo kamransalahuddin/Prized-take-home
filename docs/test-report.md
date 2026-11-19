@@ -1,220 +1,101 @@
-# board — test report (CLI + backend)
+# board: test report
 
-Scope: the `board` CLI, `store.py` (SQLite) and `server.py` (REST + SSE). The page is being
-rebuilt separately and is not covered. Final state: **all six areas pass; 90 automated
-tests green** (`.venv/bin/pytest`).
+Scope: the `board` CLI, `store.py` (SQLite), `server.py` (REST + SSE), and the page wired to
+them. Final state: 235 Python tests and 30 frontend unit tests pass. Every finding listed
+below was fixed and has a regression test, unless it is marked as accepted.
 
-## Process
+## Method
 
-1. **One validation agent** ran every command and every example in `board help` the way a
-   first-time agent would, then went through every flag, input form and exit code.
-2. **Five agents in parallel**, one per property: offline persistence, live streaming,
-   in-place updates, concurrent agents (20 writers), restart recovery.
-3. **Isolation:** each agent got its own temp `BOARD_DIR` and its own port, kept its scripts
-   in a scratch folder, and was told to test only, with no code edits. A real Python SSE
-   client recorded what a browser would receive.
-4. **Every bug** was fixed on `main`, got a regression test, and was re-checked by hand.
+1. **Unit and integration tests** (`pytest`, `vitest`) written alongside each change.
+2. **Break-it rounds.** One test agent per area, each with its own temp `BOARD_DIR` and its
+   own ports. The agents only test (no code edits) and report each finding with a repro
+   and the code location. A fix agent fixes the findings on a branch with regression
+   tests. I merge, and a fresh test agent for the same area re-checks every earlier finding
+   and then attacks again. This repeated until every area came back clean.
 
-| Area | Result | Bugs found → fixed |
+   | Area | Round 1 | Round 2 | Round 3 |
+   |---|---|---|---|
+   | CLI commands, docs, hostile input | 3 med, 6 low, then 2 high, 9 med, 9 low | 1 high, 2 med, 9 low | clean (8 low, fixed) |
+   | Crash recovery | 2 high, 5 med, 4 low | 2 med, 4 low | clean (2 low, fixed) |
+   | Duplicate writes | 3 high, 3 med, 1 low | 1 high, 1 med | clean |
+   | Network interruptions | 3 high, 2 med, 2 low | 2 high, 3 low | clean |
+   | Safe termination | 4 high, 3 med, 4 low | 4 med, 4 low | 2 med, 2 low (fixed, re-verified in round 4) |
+
+3. **Browser end-to-end** (Playwright with the system Chrome) against the real server:
+   1440×900 and 390×844 viewports, light and dark mode.
+4. **Fresh-agent tests**, run as the graders will run them: a Claude Code agent with
+   subagents does a real task on a real repo, knowing only that `board help` exists.
+
+## Results by requirement
+
+| Requirement | How it was tested | Result |
 |---|---|---|
-| CLI commands | PASS after fixes | 3 medium, 6 low → all medium and 5 low fixed |
-| Offline persistence | PASS after fixes | 2 → fixed |
-| Live streaming | PASS | 0 (1 help note added) |
-| In-place updates | PASS after fixes | 2 low → fixed |
-| Concurrent agents (20) | PASS | 0 |
-| Restart recovery | PASS after fixes | 3 → fixed |
+| CLI documented and functional | Every line and example in `board help` run literally. Every flag, value form (literal, `-`, `@file`), content kind, exit code (0/1/2/3/4, the child's code), and `BOARD_URL` mode. About 600 hostile raw-API requests (types, sizes, unicode, nesting, NaN/overflow, path traversal). | No tracebacks, no 500s, and help matches behavior. `board post` takes about 70–90 ms. |
+| Rich content | All 6 kinds rendered in the browser: line, bar, scatter and pie charts (6 series × 5,000 points, plus a 20k-point chart); PNG, JPEG, GIF, WebP and SVG; a 50k-row table; a 2 MB log; sanitized Markdown. | All render. The SVG's script does not run, `<script>` and `javascript:` links are neutralized, there are no console errors, and no request leaves the machine. |
+| Many agents at once | 20 agent processes on a barrier (mixed posts, images, upserts, logs, appends) ×3 runs, plus a 2,000-write burst, both direct and over HTTP. 50 processes racing on one request id or one key. | 0 errors, exact counts, contiguous `seq`, and every event delivered once and in order. No "database is locked". |
+| Durable | Server killed (SIGTERM / `kill -9`) during writer bursts, uploads, migrations, pruning and replay. Posting while the server is down. 300+ random `kill -9` runs per round. Disk full (5 MB volume), read-only and deleted data dirs, corrupted WAL, databases from older versions. | No committed post was ever lost. `PRAGMA integrity_check` passed every time. Old databases migrate, even when killed mid-migration. |
+| Live, pushed, no polling | SSE latency measured from the CLI call to the event: p95 170 ms for posts, about 300 ms for log lines. Browser: a new agent appears in about 170 ms and a status change in about 90 ms. | Pass. |
+| Recover missed updates | A chaos proxy (drops, mid-frame cuts, half-open stalls, throttling) for 10+ minutes with 7 browser-like clients. 35 `kill -9` restarts in 3 min. Event pruning racing slow clients. A wiped or replaced database. 300 simultaneous reconnects. | Every client ended with exactly the full event sequence and a state equal to the snapshot, or got a `reset` when it was beyond the kept window. No silent gaps. |
+| No duplicate writes | A chaos proxy that drops responses, delays past timeouts, resets, sends requests twice and forwards late: 11,603 operations in round 3. | `BAD: {}`. A write whose answer is lost exits 1 "may already have been applied", never exit 3. |
+| Safe termination | Every signal (INT, TERM, HUP, QUIT, KILL) to every command at random moments: storms, a pty Ctrl-C, grandchildren, children that ignore signals, closed stdout, `serve` with 300 clients. | No orphans (process groups), no hangs, the post is closed with its exit code, `serve` exits 0 in under 0.6 s and the WAL is checkpointed. |
+| Phone and desktop, light and dark | Screenshots of the home page, Activity and every detail view at 390 and 1440 wide, in both schemes. Long names, deep nesting, 60 agents. | No horizontal overflow, and the data shown matches the database. |
+| Offline, one install command | `pip install .` from a clean clone into a fresh venv, then serving the page. A server and CLI run under a macOS sandbox that denies all outbound network. | Works. All assets are served locally. |
 
-## 1. CLI commands — every command and help example
+## Major bugs found and fixed (selection)
 
-**How.** Ran every line of `board help` literally, then each command against these inputs:
-- `post`: all six content kinds, every value form (literal, `-` for stdin, `@file`), every
-  image type plus a non-image, invalid JSON, zero or two content sources;
-- `-t`, `-s`, `-k`;
-- `log` in run and pipe mode, including signals, command not found, ANSI codes, `\r`, and
-  200k lines;
-- `append`, `ls` and `serve`, including a second start and a busy port;
-- every help entry point, `--json`, `-q`, `BOARD_AGENT`, `BOARD_URL` (live server and dead
-  port);
-- every exit code.
+- **One malformed post took the page down for everyone.** NaN/Infinity and ~10k-deep JSON
+  made `GET /api/posts` return 500. Both are now rejected at write time, with a depth cap of
+  64.
+- **Duplicates under retries:**
+  - a reused request id with a different body returned another post;
+  - the CLI gave up while a delayed write could still commit;
+  - a 5xx error killed log streams.
 
-**Result.** Every help example works as written. Speed: `board post` takes about 68 ms
-writing to SQLite directly and about 124 ms over HTTP; `board help` takes 36 ms.
+  Writes now carry fingerprinted request ids, are retried with the same id, and transient
+  and permanent errors are told apart.
+- **Wrong question answered.** A stale Approve could land on a newer question re-asked under
+  the same `-k`. Posts now carry a `gen`; replies and streams send `expect_gen`, and a
+  replay never adopts a newer post.
+- **`board log` safety:**
+  - it didn't run the command when storage failed;
+  - it hung on backgrounded grandchildren;
+  - signals orphaned children;
+  - pipe mode lost buffered output.
 
-**Bugs, all fixed:**
-- **(med)** Text starting with `-` was read as an option: `board post -a lead "-3 failed"`,
-  `board append ID "- item"`.
-- **(med)** `"@human approve"` was always treated as a file path. Now `@` text posts as-is
-  unless it names a file or looks like a path.
-- **(med)** `serve` on a busy port printed a URL, then a uvicorn error, and exited 3. Now it
-  gives a clear message and exits 1.
-- **(low)**
-  - `--port 99999` printed a traceback.
-  - A chart with no `series` exited 1 instead of 2.
-  - `--table 'text'` made an empty table.
-  - `serve` rejected `--json` and `-q`.
-  - An unreachable `BOARD_URL` gave no fix hint.
+  The command now runs in its own process group, finishes when the child exits, and the
+  signal handlers are async-signal-safe.
+- **Missed updates:**
+  - a slow replay could be overtaken by event pruning;
+  - the live watcher skipped pruned events;
+  - a wiped database went unnoticed.
 
-**Help wording also fixed:** text starting with `-` or `@`; set `ok` after resolving a
-blocked post; a pipe log stays `info`; `ls -a` includes subagents; what exit code 1 covers.
+  The server now checks every batch, uses `EPOCH:SEQ` event ids, and sends `reset`.
+- **Unbounded memory and disk:**
+  - status changes re-sent 2 MB logs (3.45 GB RSS);
+  - stalled clients were never cut off;
+  - the event log had no limit.
 
-**Left as is (low):** `append ID -` with empty stdin succeeds, and `-n 0` is treated as 1.
+  Events are now bounded by bytes, and each client has a byte budget and a send timeout.
 
-## 2. Offline persistence
+## Fresh-agent runs (the graders' scenario)
 
-**How:**
-- With the server **not running**, posted every kind, two logs, a key update, an append and
-  a status change.
-- Checked the rows and asset files with a fresh `sqlite3` connection, then started the
-  server and compared `GET /api/posts`.
-- Checked that a client replaying from `?since=0` gets every event, including 1,100 posts
-  written by 8 parallel writers.
-- Searched everything the server serves for external URLs.
-- Ran the server and CLI under a macOS `sandbox-exec` profile that **blocks all outbound
-  network** except localhost.
-- Ran `kill -9` on a `board log` mid-run.
+1. **itsdangerous audit:** a lead agent plus 3 subagents (tests, size, review). They posted a
+   plan, live pytest logs, timing tables and charts, findings marked `warn`, and a summary.
+   The page, left open without reloading, matched the database at every 20 s frame. The
+   agent's feedback on `board help` was applied: the `@` rule, `-k` scope, `log` options,
+   the badge rule, and `ls` columns.
+2. **python-slugify fix** (`board` on PATH, default `~/.board`, told only "run board help"):
+   a lead plus 2 subagents, 0 failed board commands. It fixed 2 real bugs and added 17
+   tests. When its subagents died, it posted a `warn` itself. Feedback applied: colour codes
+   are stripped on the board, and `append -s ok` also resolves `warn` posts.
 
-**Result: PASS.**
-- With the server down, every command exited 0, and every post appeared complete once the
-  server started.
-- Images came back byte-identical.
-- The replay was complete and in order (1,115 contiguous events).
-- With the network blocked, posting, serving and all three vendored JS libraries still
-  worked.
-- No runtime calls to a CDN, fonts or analytics, and FastAPI's docs pages (which load a CDN)
-  are turned off.
-- After `kill -9`, all output except the last ~0.25 s was kept and `integrity_check` passed.
+## Accepted limitations
 
-**Bugs, both fixed:**
-- **(med)** `board serve` said "already running" when that server used a *different* data
-  folder, so the agent's posts would never appear. The server now reports its data folder,
-  and `serve` refuses on a mismatch.
-- **(med)** A `board log` killed with `-9` stayed "live" forever. Logs now record their
-  writer's process, and the server closes orphaned logs every 5 s, marking them `error` with
-  a note. Verified: a killed log was closed about 6 s later.
-
-## 3. Live streaming
-
-**How:**
-- An SSE client recorded the receive time of each event.
-- **50 posts:** measured from starting the CLI process to the event arriving.
-- **Log streaming:** a child printed a timestamped line every 100 ms for 5 s. Measured from
-  each print to its arrival, in run and pipe mode, with and without flushing.
-- **Correctness:** checked that the appended chunks join up to the stored text exactly (with
-  multi-byte UTF-8 split across batches, and a 3.4 MB log).
-- **Push, not poll:** counted connections, checked headers and timed keepalive pings.
-- **Scale:** 5 clients at once; a burst of 200 posts from 4 parallel loops.
-
-**Result: PASS.**
-- **New posts:** 122 ms median and **170 ms p95** (target < 1 s).
-- **Log lines:** arrive while the command runs, 170 ms median and 300 ms p95.
-- **One long-lived connection per client**, with `retry: 1000`, a `hello` event and
-  `: ping` every 15 s.
-- **5 clients** received identical streams.
-- **The 200-post burst** arrived complete, contiguous and in order.
-- **Status changes** arrive in about 100 ms.
-
-**Notes:**
-- A program that buffers its piped output only shows up when it exits. That's the program's
-  buffering, and the help now says to use `-- CMD` or `python -u`.
-- A log over the 2 MB cap can start mid-line. Cosmetic.
-
-## 4. In-place updates
-
-**How.** With the server and an SSE recorder running:
-- 20 `-k` updates of one post;
-- chart updates growing to 5,000 points;
-- changing kind under one key (chart → table → markdown, and log → text);
-- key scoping across agents;
-- text, markdown and log appends;
-- status-only and title-only changes;
-- **a race:** 2×50 CLI processes and 100 HTTP requests updating the same key;
-- rebuilding every post from `?since=0` using the "apply only if `seq` is newer" rule and
-  comparing it with the snapshot.
-
-**Result: PASS (9/9).**
-- **Updates:** same ID every time, exactly one row, `created_at` unchanged, `seq` strictly
-  increasing.
-- **Kind change:** an old log's text does not leak into its replacement.
-- **Race:** one row, no errors, and the final state matches the event with the highest
-  `seq`.
-- **Rebuild:** all 16 posts rebuilt from events match the snapshot exactly.
-
-**Bugs, both fixed:**
-- **(low–med)** A running `board log` kept writing into its post after `-k` replaced that
-  post with another kind. The log now stops posting; the command keeps running and its exit
-  code still comes through.
-- **(low)** `append ID ""` was a silent no-op that still bumped the post. Now exit 2.
-
-## 5. Concurrent agents — 20 writers at once
-
-**How.**
-- A driver started **20 agent processes on a barrier** (start spread 2–4 ms), named `lead`
-  and `lead/a01`…`lead/a19`.
-- Each agent made 25 mixed posts (including 1,000-point charts and CSV from files), 1 image,
-  3 `-k` updates, a 50-line streaming log and 3 appends, all through real `board` calls.
-- Checked:
-  - every exit code and all stderr;
-  - exact counts of rows, kinds, log lines and asset files;
-  - event ids contiguous, with each post's `seq` equal to its last event;
-  - each agent's own ordering;
-  - the SSE client got every event exactly once, in order;
-  - the snapshot equals the database;
-  - `integrity_check`.
-- Ran 3 times, plus a 2,000-write burst and both again over HTTP.
-
-**Result: PASS, no bugs.**
-
-| Run | Ops | Errors | Wall | p95 per call | SSE |
-|---|---|---|---|---|---|
-| Mixed ×3, direct to SQLite | 20×33 (~920 events) | 0 | ~10 s | 306–370 ms | all exact, last event ≤ 85 ms after the final write |
-| Burst, direct | 20×100 = 2,000 | 0 | 22 s | 327 ms | exact |
-| Mixed, HTTP | 20×33 | 0 | 18 s | 655 ms | exact |
-| Burst, HTTP | 2,000 | 0 | 41 s | 534 ms | exact |
-
-It never hit "database is locked". Most of each call's time is 20 Python processes starting
-at once, not waiting on SQLite.
-
-## 6. Restart recovery
-
-**How:**
-- SIGTERM and SIGINT with 3 open SSE clients.
-- Compared the full snapshot before and after a restart.
-- `kill -9` during 10 writers × 30 posts.
-- 30 posts while the server is down, then reconnecting with `Last-Event-ID` or `?since=`.
-- An EventSource-like client through 3 restarts (SIGTERM, `kill -9`, SIGINT) while posts and
-  a log stream in.
-- A 10 s `board log` across 2 restarts.
-- `BOARD_URL` writers during an outage.
-- `kill -9` during 15 MB uploads.
-- `reset` on a wiped database.
-
-**Result: PASS after fixes.**
-- **Shutdown and restart:**
-  - Graceful stop takes 0.15–0.23 s.
-  - The snapshot is identical after restart.
-  - After `kill -9`, all 300/300 posts are there with contiguous events and a passing
-    `integrity_check`.
-- **Catch-up after downtime:**
-  - The reconnecting client got **1,571/1,571 events, with no gaps or duplicates**.
-  - Missed-event replay is exact.
-- **Logs and uploads:**
-  - A log across restarts is complete and keeps its exit code.
-  - No database row ever points at a half-written image.
-
-**Bugs, all fixed:**
-- **(high)** After `kill -9`, or after a stop while a client held a connection open,
-  `board serve` refused to restart for about 30 s ("Address already in use"). My earlier
-  busy-port check caused this, because it didn't set `SO_REUSEADDR` the way uvicorn does.
-  Now it does; regression test added.
-- **(med)** In `BOARD_URL` mode, a log whose server was down when the command ended gave up
-  after about 2.5 s and lost the end of its output. It now keeps retrying for up to 60 s;
-  regression test added (server down 2.5 s → all lines and the exit code delivered).
-- **(low)** Half-written upload files left by a crash were never removed. The server now
-  deletes leftovers older than 10 minutes when it starts.
-
-## Known limitations (accepted)
-
-- **Durability:** `synchronous=NORMAL` survives process crashes, but the last commits could
-  be lost on power loss or an OS crash.
-- **Ordering ties:** `updated_at` has millisecond resolution. Ties are broken by `seq`, so
-  ordering stays correct.
+- `synchronous=NORMAL` survives process crashes. A power loss or OS crash could lose the
+  last commits.
+- Children that call `setsid`, double-fork or use job control escape the process group.
+- A signal that arrives while Python is still starting, before `board` has created a post or
+  started a child, kills it by default. Nothing exists yet, so nothing is lost.
+- `kill -9` of `board log` leaves its child running, because macOS has no parent-death
+  signal. The post is reaped as `error`.
+- No auth. Use an SSH tunnel for phone access.
