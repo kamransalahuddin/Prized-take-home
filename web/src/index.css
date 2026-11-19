@@ -634,6 +634,21 @@
 .post-image {
   margin: auto;
 }
+/* The card centers its children, which makes them shrink-to-fit. An image whose
+   width comes from its parent (an SVG with only a viewBox, or width="100%") then
+   resolves to 0x0 inside a shrink-to-fit link. Give the link the full card width
+   so the image always has a definite box to size against. */
+.post-image-link {
+  display: block;
+  align-self: stretch;
+}
+.post-image-link:focus-visible {
+  outline: none;
+}
+.post-image-link:focus-visible > .post-image {
+  outline: 2px solid var(--ring);
+  outline-offset: -3px;
+}
 .log,
 .prose pre {
   text-align: start;
