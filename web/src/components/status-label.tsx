@@ -21,15 +21,10 @@ function Dot({ className, pulse }: { className: string; pulse?: boolean }) {
   )
 }
 
-/** Status under an agent card. Color lives only on the dot/icon; the text stays fg-2. */
 export function StatusLabel({
   agent,
-  size = "default",
-  className,
 }: {
   agent: Pick<AgentNode, "state" | "status" | "live">
-  size?: "default" | "sm"
-  className?: string
 }) {
   const { state, status, live } = agent
   let mark: ReactNode
@@ -39,13 +34,7 @@ export function StatusLabel({
   else mark = <Dot className="bg-ok" />
 
   return (
-    <div
-      className={cn(
-        "text-center font-medium text-balance text-fg-2",
-        size === "sm" ? "text-xs leading-4" : "text-[13px] leading-[18px]",
-        className,
-      )}
-    >
+    <div className="text-center text-[13px] leading-[18px] font-medium text-balance text-fg-2">
       <span className="relative -top-px mr-1.5 inline-flex align-middle">{mark}</span>
       {LABEL[state]}
     </div>

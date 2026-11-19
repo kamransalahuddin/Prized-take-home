@@ -1,7 +1,8 @@
+import people from "@/lib/people.json"
 import icons from "../../../board/static/icons/solar.json"
 import { cn } from "@/lib/utils"
 
-const SET = icons as Record<string, string>
+const SET = { ...icons, ...people } as Record<string, string>
 
 /** Solar Bold icon by name ("ghost-bold" or "ghost"). Takes the text color. */
 export function Icon({ name, size = 20, className }: { name: string; size?: number; className?: string }) {

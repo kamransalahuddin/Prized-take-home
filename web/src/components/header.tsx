@@ -1,50 +1,68 @@
-import { Icon } from "@/components/icon"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { useLayoutEffect, useState, useSyncExternalStore } from "react"
+import { Moon, Sun } from "lucide-react"
 import type { Connection } from "@/lib/types"
-import { cn } from "@/lib/utils"
+import { PrizedMark } from "./prized-mark"
+import { Badge } from "./ui/badge"
+import { Button } from "./ui/button"
 
-const HINT: Record<Connection, string> = {
-  live: "Live",
-  connecting: "Connecting",
-  offline: "Connection lost",
-}
+type Theme = "Light" | "Dark"
 
-function ConnectionIndicator({ connection }: { connection: Connection }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          role="status"
-          aria-label={HINT[connection]}
-          tabIndex={0}
-          className="inline-flex size-8 items-center justify-center rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-primary"
-        >
-          {connection === "offline" ? (
-            <Icon name="expressionless-circle-bold" size={20} className="text-muted-foreground" />
-          ) : (
-            <span
-              className={cn(
-                "size-2 rounded-full",
-                connection === "live" ? "bg-busy" : "animate-pulse bg-faint",
-              )}
-            />
-          )}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
-        {HINT[connection]}
-      </TooltipContent>
-    </Tooltip>
-  )
+const systemTheme = matchMedia("(prefers-color-scheme: dark)")
+const subscribeTheme = (notify: () => void) => {
+  systemTheme.addEventListener("change", notify)
+  return () => systemTheme.removeEventListener("change", notify)
 }
+const readSystemTheme = (): Theme => systemTheme.matches ? "Dark" : "Light"
 
 export function Header({ connection }: { connection: Connection }) {
+  const osTheme = useSyncExternalStore(subscribeTheme, readSystemTheme)
+  const [override, setOverride] = useState<Theme | null>(() => {
+    try {
+      // Earlier builds stored the automatic OS choice as if it were a manual choice.
+      const saved = localStorage.getItem("board-theme-override")
+      if (saved === "Light" || saved === "Dark") return saved
+    } catch { /* browser storage is optional */ }
+    return null
+  })
+  const theme = override ?? osTheme
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = theme.toLowerCase()
+  }, [theme])
+
+  function chooseTheme(choice: Theme) {
+    const preference = choice === osTheme ? null : choice
+    setOverride(preference)
+    try {
+      if (preference) localStorage.setItem("board-theme-override", preference)
+      else localStorage.removeItem("board-theme-override")
+    } catch { /* browser storage is optional */ }
+  }
+  const next = theme === "Dark" ? "Light" : "Dark"
+  const Symbol = theme === "Dark" ? Moon : Sun
   return (
-    <header className="relative flex h-14 items-center justify-center px-4">
-      <span className="text-[15px] leading-6 font-semibold tracking-[-0.03em] text-foreground select-none">Prized</span>
-      <div className="absolute inset-y-0 right-3 flex items-center sm:right-5">
-        <ConnectionIndicator connection={connection} />
-      </div>
+    <header className="mast">
+      <nav aria-label="Board navigation">
+        <a className="brand" href="#" aria-label="Prized agent board">
+          <PrizedMark />
+          Prized
+        </a>
+        {connection !== "live" && (
+          <Badge variant="outline" role="status">
+            {connection === "offline" ? "Reconnecting" : "Connecting"}
+          </Badge>
+        )}
+        <Button
+          variant="outline"
+          type="button"
+          className="theme-button"
+          title={"Switch to " + next.toLowerCase() + " theme"}
+          aria-label={"Theme: " + theme + ". Switch to " + next}
+          onClick={() => chooseTheme(next)}
+        >
+          <Symbol size={13} />
+          {theme}
+        </Button>
+      </nav>
     </header>
   )
 }

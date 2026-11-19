@@ -10,5 +10,5 @@ export default defineConfig({
   base: "/static/",
   resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
   build: { outDir: "../board/static", emptyOutDir: false, assetsDir: "assets" },
-  server: { proxy: { "/api": "http://127.0.0.1:8000" } },
+  server: { proxy: { "/api": "http://127.0.0.1:8000", "^/static/(vendor/|chart[.]|prized[.])": "http://127.0.0.1:8000" } },
 })
