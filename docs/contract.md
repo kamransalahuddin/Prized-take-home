@@ -96,7 +96,7 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   - Pipe mode (no CMD): read stdin (exit 2 if TTY: `pipe output into board log, or use: board log -a NAME -- CMD`). EOF → `append(id, done=True)`.
     SIGINT/SIGTERM/SIGHUP/SIGQUIT: drain stdin ≤ 1 s, post what was read and close the post
     (`done`, status `error`) within 10 s of the signal (a request in flight is cut short
-    then), exit 128+N; a second signal stops posting at once. A signal while the end of the
+    then), exit 128+N; a second signal stops posting within ~1 s (a request in flight is abandoned; one short last attempt still closes the post). A signal while the end of the
     output is being posted after EOF likewise limits that to 10 s (a second one stops it)
     and exits 128+N. If posting stopped for good (warned, e.g. disk full) board still drains
     stdin, then exits 1, like `append -`; if the end of the output could not be posted in

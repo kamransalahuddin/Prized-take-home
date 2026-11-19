@@ -56,6 +56,7 @@ HINT = "Run 'board help' for usage."
 WRITE_PATIENCE = env_seconds("BOARD_WRITE_PATIENCE", 20)
 MIN_ATTEMPTS = 2  # ... and at least this many tries
 MIN_ATTEMPT_TIMEOUT = 4.0  # each try may take what is left of the patience, but at least this
+ABORT_GRACE = 1.0  # after a second stop signal: one short last attempt to close the post
 READ_PATIENCE = 5.0  # `board ls` over HTTP: a read can just be run again
 CONNECT_TIMEOUT = 3.0  # HTTP: no connection within this -> the server is not reachable
 READ_TIMEOUT = 30.0  # no request ever takes longer than this in total (headers and body)
@@ -335,8 +336,9 @@ class HttpBackend:
             if patience <= 0:
                 limit = READ_TIMEOUT
             else:
-                spare = MIN_ATTEMPT_TIMEOUT if attempts < min_attempts - 1 else 0.0
-                limit = min(READ_TIMEOUT, max(MIN_ATTEMPT_TIMEOUT, left - spare))
+                # The first try may use the whole patience (a slow answer within it is not
+                # a failure); later tries get what is left, but at least MIN_ATTEMPT_TIMEOUT.
+                limit = min(READ_TIMEOUT, max(MIN_ATTEMPT_TIMEOUT, left))
             try:
                 attempts += 1
                 return fn(limit)
@@ -588,6 +590,7 @@ class Streamer:
         self.dropped = False
         self.gave_up = False  # finish() could not post everything (warned)
         self.inflight: tuple[str, str, dict] | None = None  # (request_id, text, kw) awaiting success
+        self._abort_seen: float | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._attach(be)
 
@@ -595,9 +598,14 @@ class Streamer:
         self.thread.start()
 
     def budget(self) -> float:
-        """Seconds posting may still take (0: stop now, abandoning a request in flight)."""
+        """Seconds posting may still take (0: stop now, abandoning a request in flight).
+        A second stop signal (`abort`) cuts everything to ABORT_GRACE: a request in flight
+        is abandoned within that, but a healthy server still gets the final close (status,
+        exit code, the last bytes) instead of the post being left live."""
         if self.abort.is_set():
-            return 0.0
+            if self._abort_seen is None:
+                self._abort_seen = time.monotonic()
+            return max(0.0, self._abort_seen + ABORT_GRACE - time.monotonic())
         ends = [d for d in (self.stop_deadline, self.finish_deadline) if d is not None]
         return min(ends) - time.monotonic() if ends else float("inf")
 
@@ -788,7 +796,7 @@ class Streamer:
             nonlocal delay, told
             while not fn():
                 left = self.budget()
-                if self.abort.is_set() or left <= delay:
+                if left <= delay:  # (after a second signal the budget is ABORT_GRACE)
                     return False
                 if not told:
                     warn(f"{what}; retrying for up to {max(1, int(left))}s to post the end of the output")
