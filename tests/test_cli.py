@@ -17,8 +17,8 @@ from board.help import HELP
 from board.store import BoardError, Store
 
 BOARD_ARGV = [sys.executable, "-m", "board.cli"]
-ID_RE = re.compile(r"^p_[a-z2-7]{6}$")
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+ID_RE = re.compile(r"^p_[a-z2-7]{6,8}$")
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 32
 
 
 def ok_id(r):
@@ -455,7 +455,9 @@ def test_board_url_posts_over_http(board, store, stub_url):
 
 
 def test_board_url_unreachable_exits_3(board):
-    r = board("post", "-a", "lead", "hi", env={"BOARD_URL": "http://127.0.0.1:9"})
+    t0 = time.monotonic()
+    r = board("post", "-a", "lead", "hi", env={"BOARD_URL": "http://127.0.0.1:9", "BOARD_WRITE_PATIENCE": "1.5"})
+    assert time.monotonic() - t0 > 1.5  # retried for BOARD_WRITE_PATIENCE before giving up
     assert r.returncode == 3
     assert r.stderr.startswith("board: ") and "BOARD_URL" in r.stderr
 
@@ -618,7 +620,7 @@ def test_serve_restarts_immediately_after_kill9_with_open_client(board_env):
 
 # ---------------------------------------------------------------- ask / wait
 
-ASK_LINE = re.compile(r"^board: waiting for the human on (p_[a-z2-7]{6}) \(board wait \1 to resume\)$")
+ASK_LINE = re.compile(r"^board: waiting for the human on (p_[a-z2-7]{6,8}) \(board wait \1 to resume\)$")
 
 
 def spawn(board_env, *args, env=None):
