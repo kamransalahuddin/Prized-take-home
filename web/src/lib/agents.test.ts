@@ -107,21 +107,21 @@ describe("buildAgents tree", () => {
 
 describe("agentState", () => {
   it("maps latest status", () => {
-    expect(agentState([post("a", "info", 1)])).toEqual({ state: "running", status: "info" })
-    expect(agentState([post("a", "ok", 1)])).toEqual({ state: "done", status: "ok" })
-    expect(agentState([post("a", "warn", 1)])).toEqual({ state: "attention", status: "warn" })
-    expect(agentState([post("a", "error", 1)])).toEqual({ state: "attention", status: "error" })
+    expect(agentState([post("a", "info", 1)])).toMatchObject({ state: "running", status: "info" })
+    expect(agentState([post("a", "ok", 1)])).toMatchObject({ state: "done", status: "ok" })
+    expect(agentState([post("a", "warn", 1)])).toMatchObject({ state: "attention", status: "warn" })
+    expect(agentState([post("a", "error", 1)])).toMatchObject({ state: "attention", status: "error" })
     expect(agentState([post("a", "ok", 1), post("a", "error", 2)]).state).toBe("attention")
   })
 
-  it("blocked stays needs-input until a newer ok post", () => {
+  it("an unanswered blocked post keeps it needs-input, whatever the agent posts after it", () => {
     const blocked = post("a", "blocked", 1)
     expect(agentState([blocked]).state).toBe("needs-input")
-    expect(agentState([blocked, post("a", "info", 2)])).toEqual({ state: "needs-input", status: "blocked" })
+    expect(agentState([blocked, post("a", "info", 2)])).toEqual({ state: "needs-input", status: "blocked", cause: blocked })
     expect(agentState([blocked, post("a", "error", 2)]).state).toBe("needs-input")
-    expect(agentState([blocked, post("a", "ok", 2)])).toEqual({ state: "done", status: "ok" })
-    expect(agentState([blocked, post("a", "ok", 2), post("a", "info", 3)]).state).toBe("running")
-    // an ok post older than the blocked one doesn't resolve it
+    // A newer ok post used to turn the card "Done" while the page still showed Approve/Reject:
+    // the question is still open (the server takes a reply, `board wait` still waits).
+    expect(agentState([blocked, post("a", "ok", 2)])).toEqual({ state: "needs-input", status: "blocked", cause: blocked })
     expect(agentState([post("a", "ok", 0), blocked]).state).toBe("needs-input")
   })
 

@@ -645,7 +645,8 @@
 .sub-links {
   margin-top: 22px;
 }
-.sub-links a {
+.sub-links a,
+.from a {
   display: inline-flex;
   align-items: center;
   gap: 6px;

@@ -33,6 +33,12 @@ export interface AgentNode {
   lastActivity: string // ISO time of newest change
   latest: Post | null // newest post (for a "now doing" line in the detail view)
   posts: Post[] // this agent's posts, newest first (not including children)
+  // Open questions (blocked, unanswered, any kind) answerable on this agent's page, newest
+  // first: its own, or, for a parent that never posted, its subagents'.
+  questions: Post[]
+  // The post behind `state`: the newest open question (needs-input) or the warn/error post
+  // (attention); a parent that never posted takes its most urgent subagent's. Else null.
+  cause: Post | null
   children: AgentNode[] // subagents, same shape
 }
 

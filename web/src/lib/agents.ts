@@ -74,32 +74,36 @@ export const STATE_RANK: Record<AgentState, number> = {
 }
 
 /**
- * State of one agent from its own posts (any order).
- * - any post still `blocked` with no newer `ok` post from the agent → needs-input
- * - else the latest post's status: error/warn → attention, ok → done, info → running
+ * A post the human can still answer: `blocked` with no reply yet, of any kind (text, Markdown,
+ * table, chart, image or log; from `board ask` or `-s blocked`). The server takes a reply to
+ * exactly these (`Store.reply`) and `board wait` keeps waiting on them. A newer post from the
+ * agent does not close it; a reply, `board append ID -s ...` or a `-k` replace does.
  */
-export function agentState(posts: Post[]): { state: AgentState; status: Status } {
-  if (posts.length === 0) return { state: "running", status: "info" }
+export function isQuestion(p: Post): boolean {
+  return p.status === "blocked" && !p.payload?.reply
+}
+
+/**
+ * State of one agent from its own posts (any order), and the post behind it.
+ * - any open question (`isQuestion`) → needs-input; `cause` = the newest question
+ * - else the latest post's status: error/warn → attention (`cause` = that post), ok → done,
+ *   info → running
+ */
+export function agentState(posts: Post[]): { state: AgentState; status: Status; cause: Post | null } {
+  if (posts.length === 0) return { state: "running", status: "info", cause: null }
   const sorted = [...posts].sort(compareNewest)
-  if (posts.some(p => p.status === "blocked" && p.payload.ask && !p.payload.reply)) {
-    return { state: "needs-input", status: "blocked" }
-  }
-  for (let i = 0; i < sorted.length; i++) {
-    if (sorted[i].status !== "blocked") continue
-    // everything before index i is newer than this blocked post
-    const resolved = sorted.slice(0, i).some((p) => p.status === "ok")
-    if (!resolved) return { state: "needs-input", status: "blocked" }
-  }
-  const status = sorted[0].status
-  switch (status) {
+  const question = sorted.find(isQuestion)
+  if (question) return { state: "needs-input", status: "blocked", cause: question }
+  const latest = sorted[0]
+  switch (latest.status) {
     case "error":
     case "warn":
-      return { state: "attention", status }
+      return { state: "attention", status: latest.status, cause: latest }
     case "ok":
-      return { state: "done", status }
+      return { state: "done", status: "ok", cause: null }
     default:
-      // "blocked" can't be latest here (it would have returned above); treat as info
-      return { state: "running", status: status === "blocked" ? "info" : status }
+      // a "blocked" post here already has a reply (it can't be answered again): treat as info
+      return { state: "running", status: "info", cause: null }
   }
 }
 
@@ -133,17 +137,21 @@ function finish(d: Draft): AgentNode {
   const posts = [...d.posts].sort(compareNewest)
   let state: AgentState
   let status: Status
+  let cause: Post | null
+  let questions: Post[]
   let live: boolean
   if (posts.length > 0) {
-    const s = agentState(posts)
-    state = s.state
-    status = s.status
+    ;({ state, status, cause } = agentState(posts))
+    questions = posts.filter(isQuestion)
     live = posts.some((p) => p.kind === "log" && p.live)
   } else {
-    // A parent that never posted itself: summarize its children so the card isn't blank.
+    // A parent that never posted itself: summarize its children so the card isn't blank, and
+    // carry their open questions and the post behind the state so its page can show them.
     const top = [...children].sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state])[0]
     state = top?.state ?? "running"
     status = top?.status ?? "info"
+    cause = top?.cause ?? null
+    questions = children.flatMap((c) => c.questions).sort(compareNewest)
     live = children.some((c) => c.live)
   }
   // Newest change in this agent or anything under it.
@@ -160,6 +168,8 @@ function finish(d: Draft): AgentNode {
     lastActivity,
     latest: posts[0] ?? null,
     posts,
+    questions,
+    cause,
     children,
   }
 }
