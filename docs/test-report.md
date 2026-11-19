@@ -20,6 +20,7 @@ below was fixed and has a regression test, unless it is marked as accepted.
    | Duplicate writes | 3 high, 3 med, 1 low | 1 high, 1 med | clean |
    | Network interruptions | 3 high, 2 med, 2 low | 2 high, 3 low | clean |
    | Safe termination | 4 high, 3 med, 4 low | 4 med, 4 low | 2 med, 2 low (fixed); round 4: 1 med, 2 low (fixed) |
+   | HTTP timing + exactly-once (round 5) | — | — | round 5: 1 med, 1 low (fixed and re-measured: 16/16 posts closed after a double Ctrl-C) |
 
 3. **Browser end-to-end** (Playwright with the system Chrome) against the real server:
    1440×900 and 390×844 viewports, light and dark mode.
