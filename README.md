@@ -51,7 +51,7 @@ Icons: Solar by 480 Design (CC BY 4.0); agent portraits: Uicons by Flaticon.
 
 ## Tests
 
-`pip install '.[dev]' && pytest` (245 tests) · `cd web && npm i && npm test` (53) · browser
+`pip install '.[dev]' && pytest` (250 tests) · `cd web && npm i && npm test` (53) · browser
 check that every image and chart is visible: `cd tests/e2e && npm i && node media.mjs` (Chrome).
 Beyond unit tests, independent agents tried to break it in five rounds (hostile input,
 kill -9 under load, disk full, chaos proxies, signals); every finding was fixed with a

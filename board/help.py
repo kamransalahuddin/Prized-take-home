@@ -6,10 +6,10 @@ Use it to show what you are doing, what you found, what is failing, and
 when you need the human.
 
 WHO YOU ARE
-  Every post and log needs -a/--agent NAME. Use a short role: lead, tests.
+  post, log and ask need -a/--agent NAME. Use a short role: lead, tests.
   Subagents use PARENT/NAME (lead/tests, lead/research) so the page
-  groups them under their parent. Pass -a on every call: env vars do not
-  persist between tool calls. (BOARD_AGENT is used when -a is absent.)
+  groups them under their parent. Pass -a on every post/log/ask (append
+  and wait take the post ID instead); env vars don't persist between calls.
 
 POST
   board post -a NAME TEXT            plain text (one or two sentences)
@@ -120,5 +120,5 @@ EXIT CODES
 HABITS
   Post when you start a task, find something, hit a failure, or finish.
   When you launch a subagent, tell it its name and to run `board help`,
-  e.g. "Report progress with board -a lead/tests. Run board help first."
+  e.g. "Report with board post -a lead/tests ... Run board help first."
 """

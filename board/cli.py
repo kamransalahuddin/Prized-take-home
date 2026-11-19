@@ -999,6 +999,8 @@ app = typer.Typer(
 )
 
 AgentOpt = Annotated[Optional[str], typer.Option("-a", "--agent")]
+# append/wait identify the post by ID; a habitual -a NAME there is accepted and ignored.
+IgnoredAgentOpt = Annotated[Optional[str], typer.Option("-a", "--agent", hidden=True)]
 TitleOpt = Annotated[Optional[str], typer.Option("-t", "--title")]
 StatusOpt = Annotated[Optional[str], typer.Option("-s", "--status")]
 KeyOpt = Annotated[Optional[str], typer.Option("-k", "--key")]
@@ -1266,6 +1268,7 @@ def append_cmd(
     text: Annotated[Optional[str], typer.Argument()] = None,
     status: StatusOpt = None,
     title: TitleOpt = None,
+    agent: IgnoredAgentOpt = None,
     as_json: JsonOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
@@ -1438,6 +1441,7 @@ def ask_cmd(
 def wait_cmd(
     post_id: Annotated[Optional[str], typer.Argument(metavar="ID")] = None,
     timeout: TimeoutOpt = None,
+    agent: IgnoredAgentOpt = None,
     as_json: JsonOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
@@ -1658,6 +1662,7 @@ def wants_help(args: list[str]) -> bool:
 
 def run(args: list[str]) -> int:
     args = [clean(a) for a in args]
+    args = agent_after_command(args)
     if wants_help(args):
         out(HELP.rstrip("\n"))
         return 0
@@ -1708,6 +1713,19 @@ def run(args: list[str]) -> int:
         if "Abort" in names:
             return 130
         raise
+
+
+COMMANDS = {"post", "log", "ask", "append", "wait", "ls", "serve", "help"}
+
+
+def agent_after_command(args: list[str]) -> list[str]:
+    """`board -a NAME post ...` (the agent flag before the command) means
+    `board post -a NAME ...`: move it after the command instead of failing."""
+    if len(args) >= 3 and args[0] in ("-a", "--agent") and args[2] in COMMANDS:
+        return [args[2], args[0], args[1], *args[3:]]
+    if len(args) >= 2 and args[0].startswith("--agent=") and args[1] in COMMANDS:
+        return [args[1], args[0], *args[2:]]
+    return args
 
 
 def warn_hint() -> None:

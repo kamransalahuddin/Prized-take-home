@@ -1,7 +1,7 @@
 # board: test report
 
 Scope: the `board` CLI, `store.py` (SQLite), `server.py` (REST + SSE), and the page wired to
-them. Final state: 245 Python tests, 53 frontend unit tests and the browser media check (`tests/e2e/media.mjs`) pass. Every finding listed
+them. Final state: 250 Python tests, 53 frontend unit tests and the browser media check (`tests/e2e/media.mjs`) pass. Every finding listed
 below was fixed and has a regression test, unless it is marked as accepted.
 
 ## Method
@@ -100,6 +100,14 @@ One agent per bug, in parallel, each reproducing in a real browser before fixing
   warn/error still means "something is wrong", not "waiting", and shows the post that caused it.
 
 ## Fresh-agent runs (the graders' scenario)
+
+0. **10-agent dashboard stress test** (separate Claude Code session, in `transcripts/`): 10
+   parallel agents (research, data, frontend, backend, testing, security, viz, docs, debug,
+   coordinator), 13 nested subagents, ~68 posts in 2.5 min, every content kind and status,
+   4 Approve/Reject round trips (approve and reject both honoured). No stuck logs, empty
+   charts or broken images. Two help problems surfaced and were fixed: an example put `-a`
+   before the command (`board -a lead/tests …`, exit 2), and "pass -a on every call" made an
+   agent pass `-a` to `append`. Help now says where `-a` goes, and the CLI accepts both.
 
 1. **itsdangerous audit:** a lead agent plus 3 subagents (tests, size, review). They posted a
    plan, live pytest logs, timing tables and charts, findings marked `warn`, and a summary.
