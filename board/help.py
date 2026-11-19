@@ -19,11 +19,11 @@ POST
   board post -a NAME --chart VALUE   ECharts option object (see CHARTS)
   board post -a NAME --image FILE    PNG, JPEG, GIF, WebP or SVG
 
-  VALUE is literal text. "-" reads stdin. "@path" reads a file.
-  Text may start with "-" ("-3 tests failed"); text starting with "@" is
-  posted as-is unless it names a file or looks like a path (has a / or
-  ends in .md, .csv, ...), so pipe it in with - if in doubt.
-  Prints the new post ID (like p_3f9k2a) on stdout:
+  VALUE is literal text. "-" reads stdin. "@path" reads a file; if there
+  is no such file it is an error when the rest looks like a path (no
+  spaces, and a / or an ending like .md .csv), else the text is posted
+  as-is ("@alice.smith"). Text may start with "-". Pipe with - if unsure.
+  Prints the new post ID (like p_3f9k2a7q) on stdout:
     id=$(board post -a lead "Starting the auth refactor")
 
   Options for every post:
@@ -32,12 +32,15 @@ POST
     -k, --key NAME     replace your earlier post with this key instead of
                        adding a new one (keeps the same ID). Use it for
                        anything you update: progress, scoreboards, charts.
+                       Keys are per agent. A replace resets title and
+                       status (back to info unless -s is given).
 
 STATUS (the human scans for these)
   ok       finished or passing       warn     odd but not stopping you
   error    something is failing      blocked  you need the human; say
                                               exactly what you need
-  Your badge on the page is the status of your latest post.
+  Your badge is the status of your latest post (including a log's
+  automatic ok/error).
 
 LOGS (live, growing output)
   board log -a lead/tests -t "pytest" -- pytest -x
@@ -46,8 +49,10 @@ LOGS (live, growing output)
   make build 2>&1 | board log -a lead -t "build"
       Streams stdin live. Stays info when done: set ok/error yourself.
       Programs may buffer piped output; prefer -- CMD (or python -u).
-  Both print the ID first and copy the output to stderr, so you still
-  see it. For long commands, run them in the background.
+  Both take -t, -s, -k like post, print the ID first and copy the output
+  to stderr (so id=$(board log ...) captures only the ID). Run long
+  commands in the background. CMD gets no stdin or terminal: use -m,
+  --yes or GIT_EDITOR=true if it would prompt.
   board append ID TEXT     add text to a log, text or Markdown post
                            (TEXT can also be - or @path)
   board append ID -s ok    change a post's status (or -t its title);
@@ -61,8 +66,7 @@ ASK (need a decision? use this instead of -s blocked, then act on it)
   --timeout SECONDS  give up waiting: exit 4, the question stays open
   board wait ID      wait again (ID is on stderr); prints at once if
                      the human already replied
-  Asking again with the same -k replaces the question; a wait on the old
-  one exits 1.
+  Re-asking with the same -k replaces it; a wait on the old one exits 1.
 
 EXAMPLES
   board post -a lead "Read the codebase. Plan: fix auth, then tests."
@@ -74,9 +78,7 @@ EXAMPLES
   board post -a lead/research --md @notes/report.md
   board post -a lead/tests -t "Matrix" --table @results.csv
   board post -a lead/tests --table '[["test","result"],["login","pass"]]'
-  python summarize.py | board post -a lead/tests --table -
   board post -a lead/ui -t "Login page after fix" --image shot.png
-  board post -a lead -s blocked "Need the staging DB password to go on"
   board post -a lead -s ok -t "Done" "Auth fixed, 214/214 tests pass"
 
 CHARTS
@@ -98,13 +100,14 @@ CHARTS
 
 MORE
   board ls [-a NAME] [-n 20]   recent posts: ID AGENT KIND STATUS TITLE
-                               (-a lead also lists lead/* subagents)
+                               (no header row; TITLE falls back to the
+                               start of the text; -a lead adds lead/*)
   board serve [--port 8000] [--host 127.0.0.1]   start the web page
   Posting works even when the page server is not running; posts are
   saved in ~/.board (set BOARD_DIR to change) and appear when it starts.
-  --json   print JSON instead of the ID (every command)
-  -q       print nothing on success
+  --json   print JSON instead of the ID; -q  print nothing (any command)
   BOARD_URL  post over HTTP to a board on another machine instead
+             (if it is down: writes retry ~20 s, ls ~5 s, then exit 3)
 
 EXIT CODES
   0 ok    2 bad command or input (fix the command and retry)
