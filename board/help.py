@@ -52,6 +52,15 @@ LOGS (live, growing output)
   board append ID -s ok    change a post's status (or -t its title);
                            do this once a blocked or error post is resolved
 
+ASK (need a decision? use this instead of -s blocked, then act on it)
+  answer=$(board ask -a lead "Can I delete the users table?")
+      Posts a blocked question and waits until the human taps Approve or
+      Reject or types an answer. Prints approve, reject or answer on line
+      1, then any text the human typed on the next lines.
+  --timeout SECONDS  give up waiting: exit 4, the question stays open
+  board wait ID      wait again (ID is on stderr); prints at once if
+                     the human already replied
+
 EXAMPLES
   board post -a lead "Read the codebase. Plan: fix auth, then tests."
   board post -a lead/research -t "Findings" --md - <<'EOF'
@@ -99,6 +108,7 @@ EXIT CODES
   1 rejected by the board (unknown ID, wrong post kind, not an image,
     too large, port in use)
   3 BOARD_URL is set but that server is not reachable
+  4 board ask / wait --timeout passed with no reply yet: board wait ID
   board log -- CMD exits with CMD's exit code.
 
 HABITS

@@ -419,3 +419,93 @@ def test_durability_across_restart(tmp_path):
         assert body["seq"] == 3
     finally:
         srv2.stop()
+
+
+# ---------------------------------------------------------------- replies
+
+
+def blocked_post(client):
+    body = {"agent": "lead", "kind": "text", "payload": {"text": "Can I?", "ask": True}, "status": "blocked"}
+    r = client.post("/api/posts", json=body)
+    assert r.status_code == 201
+    return r.json()
+
+
+def test_reply_ok_and_double_click(client):
+    p = blocked_post(client)
+    assert p["payload"]["ask"] is True
+    url = f"/api/posts/{p['id']}/reply"
+    r = client.post(url, json={"action": "answer", "text": "keep the table"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == p["id"] and body["status"] == "info" and body["seq"] > p["seq"]
+    assert body["payload"]["reply"]["action"] == "answer" and body["payload"]["reply"]["text"] == "keep the table"
+    assert client.get(f"/api/posts/{p['id']}").json() == body
+    r2 = client.post(url, json={"action": "answer", "text": "keep the table"})  # second identical click
+    assert (r2.status_code, r2.json()) == (409, {"error": "already answered"})
+
+
+def test_reply_error_paths(client):
+    p = blocked_post(client)
+    info = client.post("/api/posts", json=text_post()).json()
+    url = f"/api/posts/{p['id']}/reply"
+    r = client.post("/api/posts/p_zzzzzz/reply", json={"action": "approve"})
+    assert r.status_code == 404 and "error" in r.json()
+    r = client.post(f"/api/posts/{info['id']}/reply", json={"action": "approve"})
+    assert (r.status_code, r.json()) == (409, {"error": "post is not waiting for input"})
+    bad = ({"action": "nope"}, {}, {"action": 1}, {"action": "answer"}, {"action": "answer", "text": ""},
+           {"action": "answer", "text": "x" * 10_001}, {"action": "approve", "text": 3})
+    for body in bad:
+        r = client.post(url, json=body)
+        assert r.status_code == 400 and "error" in r.json(), body
+    r = client.post(url, json={"action": "approve"})
+    assert r.status_code == 200
+    assert r.json()["payload"]["reply"]["action"] == "approve" and r.json()["payload"]["reply"]["text"] is None
+
+
+def test_reply_event_broadcast(live):
+    s = SSE(live.url + "/api/events")
+    try:
+        s.next()
+        p = httpx.post(live.url + "/api/posts", json=text_post(status="blocked")).json()
+        assert s.next(timeout=1.0)["data"]["status"] == "blocked"
+        httpx.post(live.url + f"/api/posts/{p['id']}/reply", json={"action": "reject", "text": "no"})
+        ev = s.next(timeout=1.0)
+        assert ev["event"] == "post" and ev["data"]["status"] == "info"
+        assert ev["data"]["payload"]["reply"]["action"] == "reject"
+        s.assert_quiet()
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------- idempotency (lost responses)
+
+
+def test_same_request_posted_twice_writes_once(client):
+    body = text_post(request_id="req-1")
+    a, b = client.post("/api/posts", json=body), client.post("/api/posts", json=body)
+    assert a.json() == b.json()
+    assert len(client.get("/api/posts").json()["posts"]) == 1
+
+    log = client.post("/api/posts", json={"agent": "lead", "kind": "log", "payload": {}, "live": True}).json()
+    for _ in range(2):
+        r = client.post(f"/api/posts/{log['id']}/append", json={"text": "a\n", "request_id": "c-1"})
+        assert r.status_code == 200
+    client.post(f"/api/posts/{log['id']}/append", json={"text": "b\n", "request_id": "c-2"})
+    assert client.get(f"/api/posts/{log['id']}").json()["payload"]["text"] == "a\nb\n"
+
+    q = client.post("/api/posts", json=text_post(status="blocked")).json()
+    rb = {"action": "approve", "request_id": "rep-1"}
+    r1 = client.post(f"/api/posts/{q['id']}/reply", json=rb)
+    r2 = client.post(f"/api/posts/{q['id']}/reply", json=rb)
+    assert r1.status_code == r2.status_code == 200 and r1.json() == r2.json()
+
+
+def test_asset_upload_retry_writes_once(client, tmp_path):
+    def up(**kw):
+        return client.post("/api/assets", files={"file": ("x", PNG)}, **kw).json()
+
+    a, b = up(headers={"X-Request-Id": "up-1"}), up(headers={"X-Request-Id": "up-1"})
+    c, d = up(data={"request_id": "up-2"}), up(data={"request_id": "up-2"})
+    assert a == b and c == d and a["id"] != c["id"]
+    assert len(list((tmp_path / "assets").glob("a_*"))) == 2

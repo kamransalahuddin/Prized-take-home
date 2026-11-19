@@ -614,3 +614,225 @@ def test_serve_restarts_immediately_after_kill9_with_open_client(board_env):
     srv.send_signal(_sig.SIGKILL); srv.wait(5)
     srv2, conn2 = start()  # must not fail with "Address already in use"
     conn.close(); conn2.close(); srv2.terminate(); srv2.wait(5)
+
+
+# ---------------------------------------------------------------- ask / wait
+
+ASK_LINE = re.compile(r"^board: waiting for the human on (p_[a-z2-7]{6}) \(board wait \1 to resume\)$")
+
+
+def spawn(board_env, *args, env=None):
+    return subprocess.Popen([*BOARD_ARGV, *args], env=dict(board_env, **(env or {})),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+
+
+def ask_id(proc):
+    line = proc.stderr.readline().rstrip("\n")
+    m = ASK_LINE.match(line)
+    assert m, line
+    return m.group(1)
+
+
+def test_ask_waits_for_answer(board_env, store):
+    proc = spawn(board_env, "ask", "-a", "lead", "-t", "Schema", "Can I delete the users table?")
+    pid = ask_id(proc)
+    p = store.get_post(pid)
+    assert (p["kind"], p["status"], p["title"]) == ("text", "blocked", "Schema")
+    assert p["payload"] == {"text": "Can I delete the users table?", "ask": True}
+    time.sleep(0.8)
+    assert proc.poll() is None  # still waiting
+    store.reply(pid, "answer", "No.\nArchive it instead.")
+    out, err = proc.communicate(timeout=10)
+    assert proc.returncode == 0, err
+    assert out == "answer\nNo.\nArchive it instead.\n"
+    assert store.get_post(pid)["status"] == "info"
+
+
+def test_ask_approve_without_text_and_question_from_stdin(board_env, store, tmp_path):
+    q = tmp_path / "q.txt"
+    q.write_text("Ship it?\n")
+    with open(q) as stdin:
+        proc = subprocess.Popen([*BOARD_ARGV, "ask", "-a", "lead", "-"], env=board_env, stdin=stdin,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pid = ask_id(proc)
+    assert store.get_post(pid)["payload"]["text"] == "Ship it?\n"
+    store.reply(pid, "approve")
+    out, _ = proc.communicate(timeout=10)
+    assert (proc.returncode, out) == (0, "approve\n")
+
+
+def test_ask_timeout_then_wait(board, board_env, store):
+    t0 = time.monotonic()
+    r = board("ask", "-a", "lead", "--timeout", "1", "-delete it?")
+    assert r.returncode == 4 and r.stdout == ""
+    assert 0.9 < time.monotonic() - t0 < 10
+    pid = ASK_LINE.match(r.stderr.splitlines()[0]).group(1)
+    assert f"board wait {pid}" in r.stderr.splitlines()[-1]
+    assert store.get_post(pid)["status"] == "blocked"
+    assert store.get_post(pid)["payload"]["text"] == "-delete it?"
+    assert board("wait", pid, "--timeout", "0.3").returncode == 4
+    store.reply(pid, "reject", "too risky")
+    t0 = time.monotonic()
+    r = board("wait", pid)  # already answered: prints at once
+    assert (r.returncode, r.stdout) == (0, "reject\ntoo risky\n")
+    assert time.monotonic() - t0 < 5
+    assert json.loads(board("wait", pid, "--json").stdout)["action"] == "reject"
+
+
+def test_wait_on_post_made_with_status_blocked(board, board_env, store):
+    pid = ok_id(board("post", "-a", "lead", "-s", "blocked", "Need the staging password"))
+    proc = spawn(board_env, "wait", pid)
+    time.sleep(0.7)
+    assert proc.poll() is None
+    store.reply(pid, "answer", "hunter2")
+    out, _ = proc.communicate(timeout=10)
+    assert (proc.returncode, out) == (0, "answer\nhunter2\n")
+
+
+def test_wait_errors(board, store):
+    pid = ok_id(board("post", "-a", "lead", "fyi"))
+    r = board("wait", pid)
+    assert r.returncode == 1 and "post is not waiting for input" in r.stderr
+    assert board("wait", "p_zzzzzz").returncode == 1
+    assert board("wait").returncode == 2
+    assert board("ask", "-a", "lead").returncode == 2
+    assert board("ask", "lead question").returncode == 2  # no -a
+
+
+def test_wait_ctrl_c_exits_130(board_env, store):
+    import signal as _sig
+    proc = spawn(board_env, "ask", "-a", "lead", "q?")
+    pid = ask_id(proc)
+    time.sleep(0.5)
+    proc.send_signal(_sig.SIGINT)
+    out, err = proc.communicate(timeout=10)
+    assert proc.returncode == 130 and out == ""
+    assert f"board wait {pid}" in err and "Traceback" not in err
+
+
+def _free_port():
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    return port
+
+
+def _serve(board_env, port):
+    import socket
+    p = subprocess.Popen([*BOARD_ARGV, "serve", "--port", str(port)], env=board_env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(200):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
+            return p
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError("server did not start")
+
+
+def test_ask_over_board_url_survives_server_restart(board_env, store):
+    import httpx
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    srv = _serve(board_env, port)
+    proc = spawn(board_env, "ask", "-a", "lead", "Deploy?", env={"BOARD_URL": url})
+    try:
+        pid = ask_id(proc)
+        srv.kill(); srv.wait(5)
+        time.sleep(2.5)  # several polls fail while the server is down
+        assert proc.poll() is None
+        srv = _serve(board_env, port)
+        r = httpx.post(f"{url}/api/posts/{pid}/reply", json={"action": "approve", "text": "go"})
+        assert r.status_code == 200
+        out, err = proc.communicate(timeout=15)
+        assert proc.returncode == 0, err
+        assert out == "approve\ngo\n"
+        assert err.count("Still waiting") == 1  # warned once
+    finally:
+        proc.kill()
+        srv.terminate(); srv.wait(5)
+
+
+# ---------------------------------------------------------------- idempotent writes over HTTP
+
+
+class _LossyHandler(_StubHandler):
+    """Commits every write, but drops the response the first time it sees a request_id
+    (the server committed, the client never heard back) and closes the connection."""
+
+    seen: set
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        body = json.loads(raw or b"{}")
+        rid = body.get("request_id")
+        with self.lock:
+            first = rid is not None and rid not in self.seen
+            if rid is not None:
+                self.seen.add(rid)
+            try:
+                if self.path == "/api/posts":
+                    post, created = self.store.create_post(**body)
+                    res = (201 if created else 200, dict(post, created=created))
+                else:
+                    m = re.match(r"^/api/posts/([^/]+)/append$", self.path)
+                    res = (200, self.store.append(m.group(1), **body))
+            except BoardError as e:
+                res = (e.status, {"error": e.message})
+        if first:
+            self.close_connection = True
+            return  # no response: the client sees a dropped connection and retries
+        self._send(*res)
+
+
+@pytest.fixture
+def lossy_url(tmp_path):
+    s = Store(tmp_path / "lossy")
+    handler = type("L", (_LossyHandler,), {"store": s, "seen": set()})
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}", s, handler
+    srv.shutdown()
+    srv.server_close()
+    s.close()
+
+
+def test_lost_responses_do_not_duplicate_posts_or_log_lines(board, lossy_url):
+    url, remote, handler = lossy_url
+    env = {"BOARD_URL": url}
+    pid = ok_id(board("post", "-a", "lead", "once", env=env))
+    assert [p["id"] for p in remote.list_posts()[0]] == [pid]
+    r = board("log", "-a", "lead", "--", "sh", "-c",
+              "for i in 1 2 3 4 5 6; do echo L$i; sleep 0.15; done", env=env)
+    assert r.returncode == 0, r.stderr
+    lid = r.stdout.strip()
+    assert remote.get_post(lid)["payload"]["text"] == "".join(f"L{i}\n" for i in range(1, 7))
+    assert remote.get_post(lid)["live"] is False
+    assert len(remote.list_posts()[0]) == 2
+    ok_id(board("append", pid, "more", env=env))
+    assert remote.get_post(pid)["payload"]["text"] == "once\nmore"
+    assert len(handler.seen) >= 4  # every write carried a request_id
+
+
+def test_log_over_board_url_server_killed_mid_run_lines_once(board_env, store):
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    srv = _serve(board_env, port)
+    log = subprocess.Popen(
+        [*BOARD_ARGV, "log", "-a", "lead", "--", "sh", "-c",
+         "for i in $(seq 1 30); do echo L$i; sleep 0.1; done"],
+        env=dict(board_env, BOARD_URL=url), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        pid = log.stdout.readline().strip()
+        for pause in (0.7, 0.6):
+            time.sleep(pause)
+            srv.kill(); srv.wait(5)  # SIGKILL: requests in flight may have committed
+            time.sleep(0.4)
+            srv = _serve(board_env, port)
+        log.communicate(timeout=60)
+        assert log.returncode == 0
+        p = store.get_post(pid)
+        assert p["payload"]["text"] == "".join(f"L{i}\n" for i in range(1, 31))
+        assert p["live"] is False and p["payload"]["exit_code"] == 0
+    finally:
+        log.kill()
+        srv.terminate(); srv.wait(5)

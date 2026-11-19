@@ -136,3 +136,93 @@ def test_reap_dead_logs_closes_orphaned_live_log(tmp_path):
     assert d["live"] is False and d["status"] == "error" and "ended without reporting" in d["payload"]["text"]
     assert s.get_post(alive["id"])["live"] is True
     assert s.get_post(other["id"])["live"] is True
+
+
+# ---------------------------------------------------------------- human replies
+
+
+def test_reply_flips_blocked_to_info_and_emits_post_event(store):
+    post, _ = store.create_post("lead", "text", {"text": "Can I?", "ask": True}, status="blocked")
+    assert post["payload"] == {"text": "Can I?", "ask": True}
+    seq0 = store.current_seq()
+    out = store.reply(post["id"], "approve", "go ahead")
+    assert out["status"] == "info" and out["payload"]["ask"] is True
+    rep = out["payload"]["reply"]
+    assert (rep["action"], rep["text"]) == ("approve", "go ahead") and rep["at"].endswith("Z")
+    assert out["updated_at"] >= post["updated_at"] and out["seq"] > seq0
+    (ev,) = store.events_after(seq0)
+    assert ev["type"] == "post" and ev["data"]["payload"]["reply"] == rep and ev["data"]["status"] == "info"
+    assert store.get_post(post["id"]) == out
+
+
+def test_reply_errors(store):
+    blocked, _ = store.create_post("lead", "text", {"text": "q"}, status="blocked")
+    info, _ = store.create_post("lead", "text", {"text": "fyi"})
+    with pytest.raises(BoardError) as e:
+        store.reply("p_zzzzzz", "approve")
+    assert e.value.status == 404
+    with pytest.raises(BoardError) as e:
+        store.reply(info["id"], "approve")
+    assert (e.value.status, e.value.message) == (409, "post is not waiting for input")
+    bad = (("maybe", None), ("answer", None), ("answer", "   "), ("answer", "x" * 10_001), ("approve", 5))
+    for action, text in bad:
+        with pytest.raises(BoardError) as e:
+            store.reply(blocked["id"], action, text)
+        assert e.value.status == 400, (action, text)
+    assert store.reply(blocked["id"], "answer", "x" * 10_000)["payload"]["reply"]["action"] == "answer"
+    with pytest.raises(BoardError) as e:  # double click
+        store.reply(blocked["id"], "reject")
+    assert (e.value.status, e.value.message) == (409, "already answered")
+
+
+def test_reply_note_optional(store):
+    p, _ = store.create_post("lead", "text", {"text": "q"}, status="blocked")
+    assert store.reply(p["id"], "reject", "  ")["payload"]["reply"]["text"] is None
+
+
+# ---------------------------------------------------------------- idempotent writes
+
+
+def test_create_post_same_request_id_writes_once(store):
+    a = store.create_post("lead", "text", {"text": "hi"}, request_id="r1")
+    seq = store.current_seq()
+    b = store.create_post("lead", "text", {"text": "hi"}, request_id="r1")
+    assert a == b and store.current_seq() == seq
+    assert len(store.list_posts()[0]) == 1
+
+
+def test_append_same_request_id_stores_chunk_once(store):
+    p, _ = store.create_post("lead", "log", {}, live=True)
+    r1 = store.append(p["id"], text="line 1\n", request_id="c1")
+    r2 = store.append(p["id"], text="line 1\n", request_id="c1")
+    store.append(p["id"], text="line 2\n", request_id="c2")
+    assert r1 == r2
+    assert store.get_post(p["id"])["payload"]["text"] == "line 1\nline 2\n"
+
+
+def test_reply_same_request_id_returns_first_result(store):
+    p, _ = store.create_post("lead", "text", {"text": "q"}, status="blocked")
+    a = store.reply(p["id"], "approve", request_id="x")
+    assert store.reply(p["id"], "approve", request_id="x") == a  # retry, not a double click
+    with pytest.raises(BoardError):
+        store.reply(p["id"], "approve", request_id="y")
+    assert sum(e["type"] == "post" for e in store.events_after(0)) == 2
+
+
+def test_add_asset_same_request_id_once(store):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    a = store.add_asset(png, request_id="img")
+    assert store.add_asset(png, request_id="img") == a
+    assert store.conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
+    assert len(list(store.assets_dir.glob("a_*"))) == 1
+
+
+def test_request_id_reused_for_other_op_and_pruning(store):
+    p, _ = store.create_post("lead", "log", {}, request_id="same")
+    with pytest.raises(BoardError) as e:
+        store.append(p["id"], text="x", request_id="same")
+    assert e.value.status == 409
+    store.conn.execute("INSERT INTO requests VALUES ('old', '{}', '2000-01-01T00:00:00.000Z')")
+    store.append(p["id"], text="x", request_id="new")
+    ids = {r[0] for r in store.conn.execute("SELECT id FROM requests")}
+    assert ids == {"same", "new"}
