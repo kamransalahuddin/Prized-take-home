@@ -33,14 +33,15 @@ MAX_ASSET = 20 * 1024 * 1024
 MAX_TABLE_ROWS = 50_000
 MAX_REPLY = 10_000
 REPLY_ACTIONS = ("approve", "reject", "answer")
-REQUEST_TTL = 24 * 3600  # idempotency records older than this are pruned
+REQUEST_KEEP = 100_000  # newest idempotency records kept (by insertion order, not by clock)
 MAX_PAYLOAD = 8 * 1024 * 1024  # serialized payload cap (same as the HTTP body limit)
 MAX_KEY = 100
 MAX_TITLE = 200
 MAX_DEPTH = 64  # nesting limit for JSON values (chart options, table cells, API bodies)
 MAX_PID = 2**31 - 1
 EVENT_KEEP = 20_000  # events kept for SSE replay; older clients get `reset` (refetch)
-SCHEMA_VERSION = 2
+EVENT_BYTES = 64 * 1024 * 1024  # ... and at most about this many bytes of event data
+SCHEMA_VERSION = 3
 _B32 = "abcdefghijklmnopqrstuvwxyz234567"
 
 SCHEMA = """
@@ -79,7 +80,8 @@ CREATE TABLE IF NOT EXISTS events (
   type       TEXT NOT NULL,          -- 'post' | 'append'
   post_id    TEXT NOT NULL,
   data       TEXT NOT NULL,          -- JSON event payload (see docs/contract.md)
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  size       INTEGER                 -- bytes of data (bounds the table by size)
 );
 CREATE TABLE IF NOT EXISTS requests (   -- idempotency: request_id -> stored result
   id         TEXT PRIMARY KEY,
@@ -322,7 +324,9 @@ def normalize_agent(agent: str | None) -> str:
     a = (agent or "").strip().lower()
     if not a:
         raise BoardError("-a/--agent is required (e.g. -a lead, or -a lead/tests for a subagent)")
-    if len(a) > 64 or not AGENT_RE.match(a):
+    if len(a) > 64:
+        raise BoardError(f"bad agent name {agent!r}: agent names are at most 64 characters")
+    if not AGENT_RE.match(a):
         raise BoardError(
             f"bad agent name {agent!r}: use lowercase letters, digits, . _ - and / for subagents (e.g. lead/tests)"
         )
@@ -507,8 +511,11 @@ class Store:
             tables = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if tables - {"sqlite_sequence"} and "posts" not in tables:
                 raise sqlite3.DatabaseError("not a database written by board (no posts table)")
-            self._retry(lambda: self.conn.executescript(SCHEMA))
-            self._migrate()
+            current = "meta" in tables and \
+                self.conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION
+            if not current:  # (an up-to-date database is opened without writing anything)
+                self._retry(lambda: self.conn.executescript(SCHEMA))
+                self._migrate()
             self._validate_schema()
         except sqlite3.DatabaseError as e:
             self.conn.close()
@@ -557,12 +564,9 @@ class Store:
     # -- plumbing
 
     def _migrate(self) -> None:
-        """Add columns that older databases lack (posts.gen, requests.fp)."""
+        """Add columns that older databases lack (posts.gen, requests.fp, events.size)."""
         def cols(c, table):
             return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
-
-        if "gen" in cols(self.conn, "posts") and "fp" in cols(self.conn, "requests"):
-            return
 
         def tx(c):
             if "gen" not in cols(c, "posts"):
@@ -570,6 +574,11 @@ class Store:
                 c.execute("UPDATE posts SET gen=lower(hex(randomblob(8))) WHERE gen IS NULL")
             if "fp" not in cols(c, "requests"):
                 c.execute("ALTER TABLE requests ADD COLUMN fp TEXT")
+            if "size" not in cols(c, "events"):
+                c.execute("ALTER TABLE events ADD COLUMN size INTEGER")
+                c.execute("UPDATE events SET size=LENGTH(CAST(data AS BLOB))")
+            # Covering index: the byte total is summed without reading the event data.
+            c.execute("CREATE INDEX IF NOT EXISTS events_size ON events(id, size)")
 
         self._tx(tx)
 
@@ -578,7 +587,7 @@ class Store:
                   "updated_at", "seq", "gen"},
         "log_chunks": {"post_id", "n", "text", "created_at"},
         "assets": {"id", "filename", "mime", "size", "created_at"},
-        "events": {"id", "type", "post_id", "data", "created_at"},
+        "events": {"id", "type", "post_id", "data", "created_at", "size"},
         "requests": {"id", "result", "created_at", "fp"},
     }
 
@@ -743,12 +752,29 @@ class Store:
             (etype, post_id, "{}", now_iso()),
         )
         seq = cur.lastrowid
-        if seq % 1000 == 0:  # keep the events table bounded; replay older than this -> reset
-            c.execute("DELETE FROM events WHERE id <= ?", (seq - EVENT_KEEP,))
         data["seq"] = seq
-        c.execute("UPDATE events SET data=? WHERE id=?", (json.dumps(data, ensure_ascii=False), seq))
+        raw = json.dumps(data, ensure_ascii=False)
+        size = len(raw.encode("utf-8", "surrogatepass"))
+        c.execute("UPDATE events SET data=?, size=? WHERE id=?", (raw, size, seq))
         c.execute("UPDATE posts SET seq=? WHERE id=?", (seq, post_id))
+        # Keep the events table bounded by count and by bytes (a big log must not make every
+        # resuming client replay gigabytes); replay from before the kept range -> reset.
+        if seq % 1000 == 0:
+            c.execute("DELETE FROM events WHERE id <= ?", (seq - EVENT_KEEP,))
+        if seq % 200 == 0 or size >= 64 * 1024:
+            self._prune_event_bytes(c)
         return seq
+
+    def _prune_event_bytes(self, c: sqlite3.Connection) -> None:
+        total = c.execute("SELECT COALESCE(SUM(size), 0) FROM events").fetchone()[0]
+        if total <= EVENT_BYTES:
+            return
+        row = c.execute(
+            "SELECT id FROM (SELECT id, SUM(size) OVER (ORDER BY id DESC) AS c FROM events) "
+            "WHERE c > ? ORDER BY id DESC LIMIT 1", (EVENT_BYTES,)).fetchone()
+        if row:  # never the newest event itself
+            newest = c.execute("SELECT MAX(id) FROM events").fetchone()[0]
+            c.execute("DELETE FROM events WHERE id <= ?", (min(row[0], newest - 1),))
 
     def _stored(self, c: sqlite3.Connection, op: str, request_id: str | None, fp: str | None = None) -> Any:
         """The stored result of an earlier write with this request_id, or None. The same
@@ -780,7 +806,8 @@ class Store:
             "INSERT INTO requests(id, result, created_at, fp) VALUES (?,?,?,?)",
             (request_id, json.dumps({"op": op, "result": result}, ensure_ascii=False), now_iso(), fp),
         )
-        c.execute("DELETE FROM requests WHERE created_at < ?", (iso_at(time.time() - REQUEST_TTL),))
+        # By insertion order, not wall clock: a clock jump must not forget recent request ids.
+        c.execute("DELETE FROM requests WHERE rowid <= (SELECT MAX(rowid) FROM requests) - ?", (REQUEST_KEEP,))
 
     def create_post(
         self,
@@ -855,7 +882,11 @@ class Store:
                         raise BoardError(f"post {res['id']} was replaced (--key) by a newer post since "
                                          "this request; not using it", 409)
                     return [post, res["created"]]
-                return res  # older databases stored the whole post
+                if isinstance(res, list) and res and isinstance(res[0], dict) and res[0].get("id"):
+                    # older databases stored the whole post (without gen): fill it in
+                    with contextlib.suppress(BoardError):
+                        res[0].setdefault("gen", self.get_post(res[0]["id"], c)["gen"])
+                return res
             post, created = tx(c)
             if request_id is not None:
                 self._remember(c, "create_post", request_id,
@@ -1124,11 +1155,16 @@ class Store:
         aid = new_id("a_", 8)
         filename = f"{aid}.{ext}"
         tmp = self.assets_dir / f".{filename}.tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.assets_dir / filename)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.assets_dir / filename)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()  # (disk full, ...): leave no half-written file behind
+            raise
 
         def tx(c: sqlite3.Connection):
             c.execute(

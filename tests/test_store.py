@@ -222,7 +222,18 @@ def test_request_id_reused_for_other_op_and_pruning(store):
     with pytest.raises(BoardError) as e:
         store.append(p["id"], text="x", request_id="same")
     assert e.value.status == 409
+    # Pruned by insertion order, not by clock: an old created_at (clock jump) is kept ...
     store.conn.execute("INSERT INTO requests(id, result, created_at) VALUES ('old', '{}', '2000-01-01T00:00:00.000Z')")
     store.append(p["id"], text="x", request_id="new")
     ids = {r[0] for r in store.conn.execute("SELECT id FROM requests")}
-    assert ids == {"same", "new"}
+    assert ids == {"same", "old", "new"}
+
+
+def test_requests_pruned_by_count_not_clock(store, monkeypatch):
+    from board import store as store_mod
+    monkeypatch.setattr(store_mod, "REQUEST_KEEP", 3)
+    p, _ = store.create_post("lead", "log", {}, request_id="r0")
+    for i in range(1, 6):
+        store.append(p["id"], text=f"{i}", request_id=f"r{i}")
+    ids = {r[0] for r in store.conn.execute("SELECT id FROM requests")}
+    assert ids == {"r3", "r4", "r5"}

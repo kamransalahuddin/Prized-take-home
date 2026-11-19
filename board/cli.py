@@ -48,7 +48,7 @@ FLUSH_INTERVAL = 0.25
 FINISH_PATIENCE = env_seconds("BOARD_FINISH_PATIENCE", 60)  # retry final chunk while board is down
 FLUSH_BYTES = 256 * 1024
 MAX_PENDING = 10 * 1024 * 1024
-MAX_CHUNK = 1024 * 1024  # characters per streamed append (well under the 8 MB body limit)
+MAX_CHUNK = 256 * 1024  # characters per streamed append (small events; well under the 8 MB body limit)
 HINT = "Run 'board help' for usage."
 # One-shot HTTP writes retry transient failures (connection errors, timeouts, 5xx) with the
 # SAME request_id for this long: a slow request may still commit, and the retry then returns
@@ -455,8 +455,15 @@ class Streamer:
 
     def __init__(self, be, post_id: str | None, echo: bool, expect_kind: str | None = None,
                  expect_gen: str | None = None, create: dict | None = None,
-                 on_created: Callable[[dict], None] | None = None, continuation: bool = False):
+                 on_created: Callable[[dict], None] | None = None, continuation: bool = False,
+                 opener: Callable[["Streamer"], Any] | None = None,
+                 open_failed: Callable[[BaseException], str] | None = None):
         self.be = be
+        # opener(streamer) -> backend, run first in the flusher thread: opening the store
+        # (which may wait up to 30 s on a lock) never delays the command or the stdin drain.
+        self.opener = opener
+        self.open_failed = open_failed or (lambda e: f"{err_text(e)}; not posting the output")
+        self.open_error: BaseException | None = None
         # text/markdown streams: only the first chunk is joined with a separator; later
         # chunks continue it verbatim (append raw=True), wherever the flushes fall.
         self.continuation = continuation
@@ -474,7 +481,7 @@ class Streamer:
         self.stopping = threading.Event()
         self.abort = threading.Event()  # stop retrying in finish() (a signal arrived)
         self.created = threading.Event()
-        self.dead = be is None or (post_id is None and create is None)
+        self.dead = (be is None and opener is None) or (post_id is None and create is None)
         if post_id is not None or self.dead:
             self.created.set()
         self.error: BaseException | None = None  # why posting stopped / never started
@@ -602,7 +609,19 @@ class Streamer:
             return True
         return False
 
+    def _open(self) -> bool:
+        try:
+            self.be = self.opener(self)
+            return True
+        except Exception as e:
+            self.dead, self.error, self.open_error = True, e, e
+            self.created.set()
+            warn(self.open_failed(e))
+            return False
+
     def _run(self) -> None:
+        if self.opener is not None and not self._open():
+            return
         backoff = 0.0  # create the post at once
         while True:
             if backoff:
@@ -969,12 +988,6 @@ def log_cmd(
         title = shlex.join(cmd)
     # Never break the producer: whatever goes wrong with the board, the command still
     # runs (or stdin is still drained) and its output is still echoed.
-    be, open_error = None, None
-    try:
-        be = backend()
-    except Exception as e:
-        open_error = e
-        warn(f"{err_text(e)}; {'running the command' if cmd else 'passing output through'} without posting")
     owner: dict[str, Any] = {"pid": os.getpid()}
     try:
         import socket
@@ -987,10 +1000,11 @@ def log_cmd(
         pass
     create = dict(agent=a, kind="log", payload=owner, title=title, status=s, key=k, live=True,
                   request_id=new_request_id())
-    streamer = Streamer(be, None, echo=not quiet, expect_kind="log", create=create,
-                        on_created=lambda post: emit(post, as_json, quiet))
-    if open_error is not None:
-        streamer.error = open_error
+    doing = "running the command" if cmd else "passing output through"
+    streamer = Streamer(None, None, echo=not quiet, expect_kind="log", create=create,
+                        on_created=lambda post: emit(post, as_json, quiet),
+                        opener=lambda _st: backend(),
+                        open_failed=lambda e: f"{err_text(e)}; {doing} without posting")
     streamer.start()
 
     if not cmd:  # pipe mode
@@ -1004,6 +1018,8 @@ def log_cmd(
             streamer.finish(done=True)
         if streamer.post_id is None and streamer.error is not None:
             raise streamer.error
+        if streamer.dead:  # posting stopped (warned): exit 1, like append -
+            raise typer.Exit(1)
         return
 
     rc = run_child(cmd, streamer)
@@ -1041,32 +1057,34 @@ def append_cmd(
 def append_stream(post_id: str, s: str | None, title: str | None, as_json: bool, quiet: bool) -> None:
     """`board append ID -`: stream stdin into the post. Board problems never stop the
     drain/echo; they make the exit code 1 (3 if BOARD_URL is unreachable) at the end."""
-    be, post, error = None, None, None
-    try:
+    def opener(st: Streamer):  # in the flusher thread: stdin is drained meanwhile
         be = backend()
         post = be.get_post(post_id)
         if post["kind"] not in ("log", "text", "markdown"):
             raise BoardError("can only append to log, text or markdown posts; use --key to replace", 409)
-    except Exception as e:
-        error = e
-        warn(f"{err_text(e)}; passing output through without posting")
-        be = None
-    streamer = Streamer(be, post_id if be else None, echo=not quiet,
-                        expect_kind=post["kind"] if post else None, expect_gen=post.get("gen") if post else None,
-                        continuation=bool(post) and post["kind"] in ("text", "markdown"))
+        st.expect_kind, st.expect_gen = post["kind"], post.get("gen")
+        st.continuation = post["kind"] in ("text", "markdown")
+        return be
+
+    streamer = Streamer(None, post_id, echo=not quiet, opener=opener,
+                        open_failed=lambda e: f"{err_text(e)}; passing output through without posting")
     streamer.start()
     got = stream_input(sys.stdin.fileno(), streamer)
-    final = {k: v for k, v in (("status", s), ("title", title)) if v is not None}
-    if got is not None and post and post["kind"] == "log":
-        final = {"done": True, "status": "error"}
     with StopSignals(lambda _s: streamer.abort.set()):
+        streamer.stopping.set()  # (the post's kind is known once the opener finished)
+        streamer.wake.set()
+        streamer.thread.join()
+        final = {k: v for k, v in (("status", s), ("title", title)) if v is not None}
+        if got is not None and streamer.expect_kind == "log":
+            final = {"done": True, "status": "error"}
         streamer.finish(patience=INTERRUPT_PATIENCE if got is not None else FINISH_PATIENCE, **final)
     if got is not None:
         raise typer.Exit(128 + got)
-    if error is not None:
-        raise error
+    if streamer.open_error is not None:
+        raise streamer.open_error
     if streamer.dead:
         raise typer.Exit(1)
+    be = streamer.be
     res = be.get_post(post_id)
     res.pop("payload", None)
     emit(res, as_json, quiet)

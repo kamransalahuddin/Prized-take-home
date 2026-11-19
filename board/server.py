@@ -33,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .store import MAX_ASSET, MAX_DEPTH, BoardError, Store, check_text, loads_strict
+from .store import MAX_ASSET, MAX_DEPTH, BoardError, Store, StoreUnavailable, check_text, loads_strict
 
 log = logging.getLogger("board.server")
 
@@ -61,27 +61,57 @@ PLACEHOLDER = """<!doctype html><meta charset="utf-8"><title>board</title>
 <p>board server is running. The page (board/static/index.html) is not built yet.</p>"""
 
 
+def reopen_if_replaced(store: Store) -> Store:
+    """`store`, or a new Store on the same data dir if board.db (or its -wal) was removed or
+    replaced since `store` opened it (`rm -rf ~/.board` while serving): reads and writes
+    then follow the new database (new epoch, so SSE clients get `reset`) instead of
+    serving / writing a deleted file. StoreUnavailable (503) if it cannot be reopened."""
+    try:
+        store.check_same_file()
+        return store
+    except StoreUnavailable:
+        pass
+    try:
+        new = Store(store.dir)
+    except Exception as e:
+        raise StoreUnavailable(f"board data directory was removed or replaced and cannot be reopened: "
+                               f"{getattr(e, 'message', e)} (data: {store.dir})")
+    with contextlib.suppress(Exception):
+        store.conn.close()
+    if new.epoch not in _REOPENED:  # once per new database (three connections reopen)
+        _REOPENED.add(new.epoch)
+        print(f"board: data directory was removed or replaced; now using the new database in {store.dir}",
+              file=sys.stderr, flush=True)
+    return new
+
+
+_REOPENED: set[str] = set()
+
+
 class Locked:
-    """A Store plus a lock; `call` runs a Store method in the threadpool under the lock."""
+    """A Store plus a lock; `call` runs a Store method in the threadpool under the lock.
+    Every call first checks the database file is still the one opened (else reopens)."""
 
     def __init__(self, store: Store):
         self.store = store
         self.lock = threading.Lock()
 
-    def _run(self, fn: Callable, *args, **kwargs):
+    def _run(self, name: str, *args, **kwargs):
         with self.lock:
-            return fn(*args, **kwargs)
+            # Never read from (or report success for a write into) a deleted database.
+            self.store = reopen_if_replaced(self.store)
+            return getattr(self.store, name)(*args, **kwargs)
 
     async def call(self, name: str, *args, **kwargs):
-        return await run_in_threadpool(self._run, getattr(self.store, name), *args, **kwargs)
-
-    def _write(self, fn: Callable, *args, **kwargs):
-        with self.lock:
-            self.store.check_same_file()  # never report success for a write into a deleted DB
-            return fn(*args, **kwargs)
+        return await run_in_threadpool(self._run, name, *args, **kwargs)
 
     async def write(self, name: str, *args, **kwargs):
-        return await run_in_threadpool(self._write, getattr(self.store, name), *args, **kwargs)
+        return await run_in_threadpool(self._run, name, *args, **kwargs)
+
+    def epoch(self) -> str:
+        with self.lock:
+            self.store = reopen_if_replaced(self.store)
+            return self.store.epoch
 
     def close(self) -> None:
         with self.lock:
@@ -280,8 +310,15 @@ class Hub:
             if loop.time() - checked >= 1.0:
                 checked = loop.time()
                 try:
-                    await run_in_threadpool(self.watch.check_same_file)
+                    new = await run_in_threadpool(reopen_if_replaced, self.watch)
                     replaced = False
+                    if new is not self.watch:  # a new database: every client starts over
+                        self.watch, version = new, None
+                        self.epoch = new.epoch
+                        self.last_seq = await run_in_threadpool(new.current_seq)
+                        for sub in list(self.subs):
+                            sub.drop()  # end the stream: it reconnects with the old epoch -> reset
+                        self.subs.clear()
                 except BoardError as e:
                     if not replaced:
                         print(f"board: ERROR {e.message}", file=sys.stderr, flush=True)
@@ -558,7 +595,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @app.get("/api/events")
     async def events(request: Request, since: str | None = None):
         raw = request.headers.get("last-event-id") or since
-        resume, epoch = None, reader.store.epoch
+        resume, epoch = None, await run_in_threadpool(reader.epoch)
         if raw not in (None, ""):
             m = RESUME_RE.match(raw.strip())
             if not m:
