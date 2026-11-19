@@ -1,7 +1,7 @@
 # board: test report
 
 Scope: the `board` CLI, `store.py` (SQLite), `server.py` (REST + SSE), and the page wired to
-them. Final state: 245 Python tests and 30 frontend unit tests pass. Every finding listed
+them. Final state: 245 Python tests, 53 frontend unit tests and the browser media check (`tests/e2e/media.mjs`) pass. Every finding listed
 below was fixed and has a regression test, unless it is marked as accepted.
 
 ## Method
@@ -77,6 +77,27 @@ below was fixed and has a regression test, unless it is marked as accepted.
   - the event log had no limit.
 
   Events are now bounded by bytes, and each client has a byte budget and a send timeout.
+
+## UI bugs found by hand after the page was wired (round 6)
+
+One agent per bug, in parallel, each reproducing in a real browser before fixing:
+
+- **Some images were invisible.** SVGs with only a `viewBox` (or `width="100%"`) have no
+  intrinsic width; the image link sat in a centered flex column, shrank to 0 px, and took the
+  image with it (loaded, but 0×0). The link now stretches to the card. `tests/e2e/media.mjs`
+  posts all formats, sizeless SVGs, huge and tall images and 5 chart types through the real
+  CLI and checks, without scrolling, at 390/1440 × light/dark, that each is visible, keeps its
+  aspect ratio and fits; it fails on the old CSS. Passes in Chromium, WebKit and Firefox.
+- **Text flickered after Approve/Reject.** The form showed "Reply sent" until the SSE event
+  arrived a frame later, and a duplicate React key left an answered table question on screen.
+  The reply response is now merged at once (the SSE event is then a no-op), keys are unique,
+  and the title no longer replays its animation. Recorded frame by frame: one change per click.
+- **"Requires attention"/"Needs input" without buttons.** The card and the detail page used
+  different rules for "waiting": blocked logs, a blocked post followed by a newer `ok` post,
+  questions about a parent's subagent, and older second questions had no Approve/Reject. One
+  rule now drives both (any blocked, unanswered post), every open question gets its own
+  buttons and content, and a parent's page shows the subagent post behind its label. Plain
+  warn/error still means "something is wrong", not "waiting", and shows the post that caused it.
 
 ## Fresh-agent runs (the graders' scenario)
 
