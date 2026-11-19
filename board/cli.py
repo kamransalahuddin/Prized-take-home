@@ -348,7 +348,12 @@ def is_file(path: str) -> bool:
 
 def read_file_bytes(path: str) -> bytes:
     if not is_file(path):
-        raise InputError(f"file not found: {path}")
+        p = Path(path).expanduser()
+        try:
+            exists = p.exists()
+        except (OSError, ValueError):
+            exists = False
+        raise InputError(f"not a regular file: {path}" if exists else f"file not found: {path}")
     try:
         return Path(path).expanduser().read_bytes()
     except OSError as e:
@@ -410,7 +415,7 @@ def title_text(title: str | None) -> str | None:
 
 def post_id_arg(post_id: str) -> str:
     if not POST_ID_RE.match(post_id):
-        raise InputError(f"bad post ID {post_id!r}: IDs look like p_3f9k2a7q (printed by board post)")
+        raise InputError(f"bad post ID {post_id!r}: IDs look like p_3fak2a7q (printed by board post)")
     return post_id
 
 
@@ -1062,7 +1067,7 @@ def append_stream(post_id: str, s: str | None, title: str | None, as_json: bool,
         be = backend()
         post = be.get_post(post_id)
         if post["kind"] not in ("log", "text", "markdown"):
-            raise BoardError("can only append to log, text or markdown posts; use --key to replace", 409)
+            raise BoardError("can only append to log, text or markdown posts; use board post -k KEY to replace it", 409)
         st.expect_kind, st.expect_gen = post["kind"], post.get("gen")
         st.continuation = post["kind"] in ("text", "markdown")
         return be
@@ -1234,6 +1239,8 @@ def ls_cmd(
             pl = p.get("payload") or {}
             label = (pl.get("text") or pl.get("markdown") or "").strip()[:60]
         label = " ".join((label or "").split()) or "-"
+        # Never let posted text drive the terminal (escape sequences, bells).
+        label = "".join(c for c in label if c >= " " and not ("\x7f" <= c <= "\x9f")) or "-"
         out("\t".join([p["id"], p["agent"], p["kind"], p["status"], label]))
 
 

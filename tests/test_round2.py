@@ -420,10 +420,10 @@ def test_P2_8_raw_append_store_and_api(store, client):
 
 def test_F_help_and_id_message_use_8_char_ids(board):
     from board.help import HELP
-    assert "p_3f9k2a7q" in HELP and "p_3f9k2a " not in HELP and "p_3f9k2a)" not in HELP
+    assert "p_3fak2a7q" in HELP and "p_3f9k2a " not in HELP and "p_3f9k2a)" not in HELP
     r = board("append", "nope", "x")
     clean_fail(r, 2)
-    assert "p_3f9k2a7q" in r.stderr
+    assert "p_3fak2a7q" in r.stderr
 
 
 @pytest.mark.parametrize("value", ["[[]]", "[{}]", '[["a"]]', '{"columns": [], "rows": []}', '{"columns": ["a"], "rows": []}'])

@@ -590,7 +590,9 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     async def list_posts(agent: str | None = None, limit: str = "200"):
         if not LIMIT_RE.match(limit):
             raise BoardError("limit must be a positive integer (ASCII digits)")
-        n = int(limit)
+        n = int(limit) if len(limit) <= 9 else 10**9
+        if n < 1:
+            raise BoardError("limit must be a positive integer (ASCII digits)")
         posts, seq = await reader.call("list_posts", agent=agent or None, limit=n)
         return JSONResponse({"posts": posts, "seq": seq, "epoch": reader.store.epoch},
                             headers={"X-Board-Data": str(reader.store.dir)})

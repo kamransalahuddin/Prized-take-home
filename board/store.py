@@ -187,7 +187,10 @@ def loads_strict(s: str, what: str, depth: int = MAX_DEPTH) -> Any:
     except RecursionError:
         raise _too_deep(what, depth)
     except ValueError as e:
-        raise BoardError(f"{what}: {e}")
+        msg = str(e)
+        if "integer string conversion" in msg:
+            msg = "a number has too many digits (at most 4300)"
+        raise BoardError(f"{what}: {msg}")
     if not depth_ok(v, depth):
         raise _too_deep(what, depth)
     return v
@@ -968,7 +971,7 @@ class Store:
             chunk = None
             if text:
                 if kind not in APPENDABLE:
-                    raise BoardError("can only append to log, text or markdown posts; use --key to replace", 409)
+                    raise BoardError("can only append to log, text or markdown posts; use board post -k KEY to replace it", 409)
                 if kind == "log":
                     chunk = text + ("\n" if newline and not text.endswith("\n") else "")
                     n = c.execute("SELECT COALESCE(MAX(n), 0) + 1 FROM log_chunks WHERE post_id=?", (post_id,)).fetchone()[0]

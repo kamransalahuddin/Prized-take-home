@@ -162,7 +162,7 @@ See `board/help.py` for the user-facing text (verbatim; must stay â‰¤80 cols, â‰
 Post object (from `store.get_post` / `list_posts`, in API responses and `post` events):
 
 ```json
-{"id":"p_3f9k2a7q","agent":"lead/tests","kind":"text|markdown|table|chart|image|log",
+{"id":"p_3fak2a7q","agent":"lead/tests","kind":"text|markdown|table|chart|image|log",
  "title":"pytest or null","status":"info|ok|warn|error|blocked","key":"latency or null",
  "live":false,"created_at":"2026-11-18T16:45:12.345Z","updated_at":"...","seq":1042,
  "gen":"9f2c4e1a7b3d5c60","payload":{...}}
@@ -270,7 +270,7 @@ data: {full post object, incl. "seq" and "gen"}
 
 id: e3b0c442:1043
 event: append
-data: {"id":"p_3f9k2a7q","agent":"lead/tests","kind":"log","text":"chunk\n","status":"info",
+data: {"id":"p_3fak2a7q","agent":"lead/tests","kind":"log","text":"chunk\n","status":"info",
        "title":"pytest","live":true,"truncated":false,"exit_code":null,
        "updated_at":"...","seq":1043}
 

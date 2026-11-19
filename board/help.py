@@ -23,7 +23,7 @@ POST
   is no such file it is an error when the rest looks like a path (no
   spaces, and a / or an ending like .md .csv), else the text is posted
   as-is ("@alice.smith"). Text may start with "-". Pipe with - if unsure.
-  Prints the new post ID (like p_3f9k2a7q) on stdout:
+  Prints the new post ID (like p_3fak2a7q) on stdout:
     id=$(board post -a lead "Starting the auth refactor")
 
   Options for every post:
@@ -39,8 +39,8 @@ STATUS (the human scans for these)
   ok       finished or passing       warn     odd but not stopping you
   error    something is failing      blocked  you need the human; say
                                               exactly what you need
-  Your badge is the status of your latest post (including a log's
-  automatic ok/error).
+  Your badge is the status of your latest post (incl. a log's ok/error),
+  but an unanswered blocked post keeps it blocked until set ok/answered.
 
 LOGS (live, growing output)
   board log -a lead/tests -t "pytest" -- pytest -x
@@ -64,8 +64,8 @@ ASK (need a decision? use this instead of -s blocked, then act on it)
       Reject or types an answer. Prints approve, reject or answer on line
       1, then any text the human typed on the next lines.
   --timeout SECONDS  give up waiting: exit 4, the question stays open
-  board wait ID      wait again (ID is on stderr); prints at once if
-                     the human already replied
+  board wait ID      wait again (ID is on stderr; waits through server
+                     outages); prints at once if the human replied
   Re-asking with the same -k replaces it; a wait on the old one exits 1.
 
 EXAMPLES
