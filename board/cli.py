@@ -59,6 +59,7 @@ DRAIN_AFTER_EXIT = 1.0  # read the pipe this long after the child exits (grandch
 STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT") if hasattr(signal, n))
 WAIT_POLL_LOCAL = 0.5
 WAIT_POLL_HTTP = 1.0
+SERVER_ERROR_PATIENCE = float(os.environ.get("BOARD_SERVER_ERROR_PATIENCE", 30))  # wait: give up on 5xx
 EXIT_TIMEOUT = 4
 POST_ID_RE = re.compile(r"^p_[a-z2-7]{4,16}$")
 REAP_EVERY = 60.0  # direct mode: close orphaned live logs at most this often (any command)
@@ -987,14 +988,20 @@ def wait_for_reply(be, post_id: str, timeout: float | None, as_json: bool, post:
     warned = False
     first = post is None
     gen = post.get("gen") if post else None
+    failing_since: float | None = None
     try:
         while True:
             if post is None:
                 try:
                     post = be.get_post(post_id, patience=0)
+                    failing_since = None
                 except Exception as e:
                     if not is_transient(e):
                         raise
+                    if isinstance(e, ServerError):  # a 502 blip is fine; a server stuck on 500s is not
+                        failing_since = failing_since or time.monotonic()
+                        if time.monotonic() - failing_since > SERVER_ERROR_PATIENCE:
+                            raise
                     if not warned:
                         hint = f"Still waiting for the reply on {post_id}."
                         warn(f"{err_text(e)} {hint}" if isinstance(e, Unreachable)

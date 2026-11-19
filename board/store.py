@@ -136,10 +136,10 @@ def dumps_checked(obj: Any, what: str = "payload", limit: int | None = MAX_PAYLO
     try:
         s = json.dumps(obj, ensure_ascii=False, allow_nan=False)
         n = len(s.encode("utf-8"))
+    except UnicodeEncodeError:  # (a ValueError subclass: must come first)
+        raise BoardError(f"{what}: text is not valid UTF-8 (lone surrogate)")
     except ValueError as e:
         raise BoardError(f"{what}: NaN and Infinity are not allowed (use null): {e}")
-    except UnicodeEncodeError:
-        raise BoardError(f"{what}: text is not valid UTF-8 (lone surrogate)")
     except RecursionError:
         raise BoardError(f"{what}: nested too deeply")
     if limit is not None and n > limit:
