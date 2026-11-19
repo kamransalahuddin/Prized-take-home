@@ -281,11 +281,17 @@ data: {"t": 1763484312}     (every 15 s, on a timer, whether or not events are f
                              reconnect when nothing arrived for 45 s.)
 ```
 
-`reset` carries `{"seq": N, "epoch": "…"}`: refetch the snapshot.
+`reset` carries `{"seq": N, "epoch": "…"}` (and `id: EPOCH:N`): refetch the snapshot.
 
 - Server: register subscriber queue FIRST, then replay `events_after(since)` in batches,
   then stream live; drop any event with id ≤ last sent (dedupe). If `since` is older than
-  `min_event_id()-1` (shouldn't happen; events are never deleted) send `event: reset`.
+  `min_event_id()-1` (the events were pruned) send `event: reset`. Events are never skipped
+  silently: if pruning overtakes a slow replay (a batch does not start at last+1), the
+  stream sends `reset` and goes on from the current end; if the live watcher falls behind
+  pruning (server stalled while > 20,000 events / 64 MB were written), every stream is
+  ended and reconnects into a `reset`. `reset` carries `id: EPOCH:SEQ` (the position the
+  stream continues from), so the browser's Last-Event-ID moves to the current epoch and the
+  next reconnect does not reset again; `hello` and `ping` carry no id.
 - `post` = create / key replace (new `gen`) / reply / re-blocking an answered post (full
   object). `append` = every other change to an existing post: a text chunk and/or the
   current status/title/live/truncated/exit_code. A status/title/`done`/exit_code change

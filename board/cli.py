@@ -113,6 +113,7 @@ class MaybeApplied(Transient):
         super().__init__(f"BOARD_URL {url} did not answer ({cause}); the write may already have been "
                          f"applied (request id {request_id}); check with board ls before repeating it")
         self.request_id = request_id
+        self.short = f"BOARD_URL {url} did not answer ({cause})"
 
 
 def is_transient(e: BaseException) -> bool:
@@ -548,7 +549,7 @@ class Streamer:
     def _retry_later(self, e: BaseException) -> bool:
         self.last_error = e
         if not self.warned:
-            warn(f"could not post output to the board (will retry): {err_text(e)}")
+            warn(f"could not post output to the board (will retry): {getattr(e, 'short', None) or err_text(e)}")
             self.warned = True
         return False
 
@@ -1311,7 +1312,7 @@ def serve_cmd(
             self._captured_signals.clear()  # (uvicorn would re-raise the signal afterwards)
 
     config = uvicorn.Config(application, host=host, port=port, workers=1, timeout_graceful_shutdown=2,
-                            log_level="warning")
+                            log_level="warning", backlog=2048)  # a burst of SSE reconnects
     Server(config).run()
 
 

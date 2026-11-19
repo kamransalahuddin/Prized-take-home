@@ -204,6 +204,12 @@ def ping_frame() -> bytes:
     return sse_frame("ping", {"t": int(time.time())})
 
 
+def reset_frame(seq: int, epoch: str) -> bytes:
+    """`reset` carries an id (the position the stream goes on from), so the browser's
+    Last-Event-ID moves to this epoch and a later reconnect does not reset again."""
+    return sse_frame("reset", {"seq": seq, "epoch": epoch}, f"{epoch}:{seq}")
+
+
 def sse_frame(event: str, data: Any, eid: int | str | None = None) -> bytes:
     head = f"id: {eid}\n" if eid is not None else ""
     return f"{head}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
@@ -335,6 +341,16 @@ class Hub:
                     batch = await run_in_threadpool(self.watch.events_after, self.last_seq, 1000, BATCH_BYTES)
                     if not batch:
                         break
+                    if batch[0]["id"] != self.last_seq + 1:
+                        # Events this watcher never saw were pruned (the server was stalled
+                        # while > 20,000 events / 64 MB were written): connected clients
+                        # would silently miss them. End every stream; each reconnects with
+                        # its Last-Event-ID, which is now older than the oldest kept event,
+                        # and gets `reset`.
+                        log.warning("SSE watcher fell behind event pruning; clients will reset")
+                        for sub in list(self.subs):
+                            sub.drop()
+                        self.subs.clear()
                     for e in batch:
                         if e["id"] <= self.last_seq:
                             continue
@@ -614,12 +630,19 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 if resume is not None:
                     lowest = await reader.call("min_event_id")
                     if resume > current or resume < 0 or (lowest and resume < lowest - 1):
-                        yield sse_frame("reset", {"seq": current, "epoch": epoch})
+                        yield reset_frame(current, epoch)
                         last = current
                 while not hub.stopping.is_set():  # replay what the client missed, in batches
                     batch = await reader.call("events_after", last, REPLAY_BATCH, BATCH_BYTES)
                     if not batch:
                         break
+                    if batch[0]["id"] != last + 1:
+                        # Pruning overtook this (slow) replay: events after `last` are gone.
+                        # Never skip them silently: reset, then go on from the current end.
+                        current = await reader.call("current_seq")
+                        yield reset_frame(current, epoch)
+                        last = current
+                        continue
                     for e in batch:
                         if hub.stopping.is_set():
                             return

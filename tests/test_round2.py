@@ -593,3 +593,102 @@ def test_F2_pipe_log_exit_1_when_posting_stopped(board_env, store):
                        env=board_env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 1, r.stderr
     assert "stopped posting" in r.stderr
+
+
+# ---------------------------------------------------------------- network batch (F1-F5)
+
+
+def test_F1_pruning_during_slow_replay_sends_reset(tmp_path, monkeypatch):
+    from test_sse_robustness import Live, read_events
+
+    from board import server as server_mod
+    monkeypatch.setattr(server_mod, "REPLAY_BATCH", 5)
+    d = tmp_path / "data"
+    st = Store(d)
+    for i in range(30):
+        st.create_post("x", "text", {"text": f"t{i}"})
+    live = Live(d)
+    reader = live.app.state.reader.store
+    orig = reader.events_after
+    calls = []
+
+    def pruned_after_first_batch(seq, *a, **k):
+        calls.append(seq)
+        if len(calls) == 2:
+            st.conn.execute("DELETE FROM events WHERE id <= 20")  # pruning overtakes the replay
+        return orig(seq, *a, **k)
+
+    reader.events_after = pruned_after_first_batch
+    try:
+        epoch = reader.epoch
+        evs = read_events(live.url + "/api/events", params={"since": "0"},
+                          until=lambda e: e["event"] == "reset", n=40)
+        names = [e["event"] for e in evs]
+        assert names == ["hello"] + ["post"] * 5 + ["reset"], names
+        assert evs[-1]["id"] == f"{epoch}:30" and evs[-1]["data"]["seq"] == 30  # F5: reset has an id
+    finally:
+        live.stop()
+        st.close()
+
+
+def test_F2_watcher_behind_pruning_ends_streams_into_reset(tmp_path):
+    from test_sse_robustness import Live, read_events
+
+    d = tmp_path / "data"
+    st = Store(d)
+    st.create_post("x", "text", {"text": "first"})
+    live = Live(d)
+    hub = live.app.state.hub
+    orig = hub.watch.events_after
+    done = []
+
+    def stalled(seq, *a, **k):  # as if the server was stopped while events were pruned
+        if not done and st.current_seq() > seq + 2:
+            st.conn.execute("DELETE FROM events WHERE id <= ?", (seq + 2,))
+            done.append(seq)
+        return orig(seq, *a, **k)
+
+    hub.watch.events_after = stalled
+    try:
+        got, ended = [], threading.Event()
+
+        def client():
+            got.extend(read_events(live.url + "/api/events", n=100, timeout=10))
+            ended.set()
+
+        t = threading.Thread(target=client, daemon=True)
+        t.start()
+        time.sleep(0.5)
+        for i in range(5):
+            st.create_post("x", "text", {"text": f"n{i}"})
+        assert ended.wait(8), "stream was not ended after the gap"
+        assert [e["event"] for e in got] == ["hello"]  # nothing after the gap was sent silently
+        evs = read_events(live.url + "/api/events", headers={"Last-Event-ID": f"{st.epoch}:1"}, n=2)
+        assert [e["event"] for e in evs] == ["hello", "reset"]
+    finally:
+        live.stop()
+        st.close()
+
+
+def test_F3_stopped_server_is_maybe_applied_not_unreachable(board_env, monkeypatch, capsys):
+    port = free_port()
+    p = subprocess.Popen([*BOARD_ARGV, "serve", "--port", str(port)], env=board_env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_port(port)
+        p.send_signal(signal.SIGSTOP)
+        monkeypatch.setattr(cli_mod, "READ_TIMEOUT", 0.5)
+        monkeypatch.setattr(cli_mod, "WRITE_PATIENCE", 0.5)
+        monkeypatch.setenv("BOARD_URL", f"http://127.0.0.1:{port}")
+        assert cli_mod.run(["post", "-a", "x", "hello"]) == 1
+        err = capsys.readouterr().err
+        assert "may already have been applied" in err and "cannot reach" not in err
+    finally:
+        p.send_signal(signal.SIGCONT)
+        p.terminate()
+        p.wait(15)
+
+
+def test_F4_serve_uses_a_large_listen_backlog():
+    import inspect
+    assert "backlog=2048" in inspect.getsource(cli_mod.serve_cmd)
