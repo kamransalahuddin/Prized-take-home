@@ -54,9 +54,9 @@ def test_append_events(store):
     store.append(lg["id"], "chunk")
     store.append(lg["id"], status="warn")
     evs = store.events_after(lg["seq"])
-    assert [e["type"] for e in evs] == ["append", "post"]
+    assert [e["type"] for e in evs] == ["append", "append"]  # status-only change: small append, text ""
     assert evs[0]["data"]["text"] == "chunk" and evs[0]["data"]["seq"] == evs[0]["id"]
-    assert evs[1]["data"]["status"] == "warn"
+    assert evs[1]["data"]["status"] == "warn" and evs[1]["data"]["text"] == ""
 
 
 def test_log_cap_truncates(store):

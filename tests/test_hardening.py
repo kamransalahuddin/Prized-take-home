@@ -239,7 +239,9 @@ def test_api_types_and_since_range(client):
     assert r.status_code == 400
     p = client.post("/api/posts", json={"agent": "x", "kind": "log", "payload": {}, "live": True}).json()
     assert client.post(f"/api/posts/{p['id']}/append", json={"done": "false"}).status_code == 400
-    with client.stream("GET", "/api/events?since=-99999999999999999999") as s:
+    for bad in ("-99999999999999999999", "1_0", "１２", "99999999999999999999999"):
+        assert client.get("/api/events", params={"since": bad}).status_code == 400  # ASCII digits only
+    with client.stream("GET", "/api/events?since=999999999999999999") as s:
         lines = []
         for line in s.iter_lines():
             lines.append(line)

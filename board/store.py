@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS requests (   -- idempotency: request_id -> stored res
   fp         TEXT                    -- sha256 of op + normalized arguments
 );
 CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at);
+CREATE TABLE IF NOT EXISTS meta (       -- epoch: random id of this database (SSE resume check)
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL
+);
+INSERT OR IGNORE INTO meta(key, value) VALUES ('epoch', lower(hex(randomblob(4))));
 """
 
 
@@ -404,6 +409,7 @@ class Store:
         except BaseException:
             self.conn.close()
             raise
+        self.epoch = self.conn.execute("SELECT value FROM meta WHERE key='epoch'").fetchone()[0]
         self._ident = self._file_ident(self.db_path)
         self._wal_ident = self._file_ident(Path(str(self.db_path) + "-wal"))
 
@@ -569,12 +575,20 @@ class Store:
                     c.execute("COMMIT")
         return posts, seq
 
-    def events_after(self, seq: int, limit: int = 1000) -> list[dict]:
-        """[{id, type, post_id, data}] with id > seq, ascending. `data` is the decoded event payload."""
-        rows = self.conn.execute(
+    def events_after(self, seq: int, limit: int = 1000, max_bytes: int = 1024 * 1024) -> list[dict]:
+        """[{id, type, post_id, data}] with id > seq, ascending, at most `limit` events and
+        about `max_bytes` of event data (always at least one event). An empty list means
+        there is nothing newer. `data` is the decoded event payload."""
+        out: list[dict] = []
+        total = 0
+        for r in self.conn.execute(
             "SELECT id, type, post_id, data FROM events WHERE id>? ORDER BY id LIMIT ?", (seq, limit)
-        ).fetchall()
-        return [{"id": r[0], "type": r[1], "post_id": r[2], "data": json.loads(r[3])} for r in rows]
+        ):
+            if out and total + len(r[3]) > max_bytes:
+                break
+            total += len(r[3])
+            out.append({"id": r[0], "type": r[1], "post_id": r[2], "data": json.loads(r[3])})
+        return out
 
     def min_event_id(self) -> int:
         return self.conn.execute("SELECT MIN(id) FROM events").fetchone()[0] or 0
@@ -775,14 +789,22 @@ class Store:
                     )
                     size = c.execute("SELECT SUM(LENGTH(text)) FROM log_chunks WHERE post_id=?", (post_id,)).fetchone()[0]
                     if size > LOG_CAP:
+                        # Keep exactly the last LOG_CAP characters (code points), so a client
+                        # that concatenates the chunks can reproduce the stored text.
                         payload["truncated"] = True
+                        excess = size - LOG_CAP
                         for cn, ln in c.execute(
                             "SELECT n, LENGTH(text) FROM log_chunks WHERE post_id=? ORDER BY n", (post_id,)
                         ).fetchall():
-                            if size <= LOG_CAP or cn == n:
+                            if excess <= 0:
                                 break
-                            c.execute("DELETE FROM log_chunks WHERE post_id=? AND n=?", (post_id, cn))
-                            size -= ln
+                            if ln <= excess:
+                                c.execute("DELETE FROM log_chunks WHERE post_id=? AND n=?", (post_id, cn))
+                                excess -= ln
+                            else:
+                                c.execute("UPDATE log_chunks SET text=substr(text, ?) WHERE post_id=? AND n=?",
+                                          (excess + 1, post_id, cn))
+                                excess = 0
                 else:
                     field = "text" if kind == "text" else "markdown"
                     sep = "\n" if kind == "text" else "\n\n"
@@ -795,12 +817,14 @@ class Store:
             size = None
             if kind == "log":
                 size = c.execute("SELECT COALESCE(SUM(LENGTH(text)),0) FROM log_chunks WHERE post_id=?", (post_id,)).fetchone()[0]
-            if chunk is not None:
+            if chunk is not None or gen == r["gen"]:
+                # Text and/or status/title/live/exit_code changes travel as a small `append`
+                # event ("text" may be ""): never re-send a whole (up to 2 MB) log.
                 ev = {
                     "id": post_id,
                     "agent": r["agent"],
                     "kind": kind,
-                    "text": chunk,
+                    "text": chunk or "",
                     "status": new_status,
                     "title": new_title,
                     "live": bool(live),
@@ -809,7 +833,7 @@ class Store:
                     "updated_at": ts,
                 }
                 seq = self._event(c, "append", post_id, ev)
-            else:
+            else:  # re-opened question (reply cleared, new gen): the full post
                 post = self.get_post(post_id, c)
                 seq = self._event(c, "post", post_id, dict(post))
             return {"id": post_id, "seq": seq, "status": new_status, "title": new_title, "live": bool(live),

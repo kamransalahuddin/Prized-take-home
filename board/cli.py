@@ -577,7 +577,8 @@ class Streamer:
         if self.post_id is None:
             if not until(self._create):
                 self.error = self.error or self.last_error
-                warn("could not create the log post on the board; the output was not posted"
+                left = len(self._take(final=True).encode("utf-8", "replace"))
+                warn(f"could not create the log post on the board; {left} bytes of output were not posted"
                      + (f" ({err_text(self.last_error)})" if self.last_error else ""))
                 return
             if self.dead:
@@ -595,8 +596,8 @@ class Streamer:
             chunks.append((new_request_id(), "", final_kw))
         for n, (rid, chunk, kw) in enumerate(chunks):
             if not until(lambda: self._send(rid, chunk, **kw)):
-                left = sum(len(c[1]) for c in chunks[n:])
-                warn(f"giving up: {left} characters of output not posted to {self.post_id}")
+                left = sum(len(c[1].encode("utf-8", "replace")) for c in chunks[n:])
+                warn(f"giving up: {left} bytes of output not posted to {self.post_id}")
                 return
             if self.dead:
                 return

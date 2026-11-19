@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import signal
 import sqlite3
 import sys
@@ -41,7 +42,11 @@ MAX_POST_BODY = 8 * 1024 * 1024
 POLL_INTERVAL = 0.1
 PING_INTERVAL = 15.0
 QUEUE_MAX = 5000  # events buffered per SSE client before it is dropped (it reconnects + replays)
+QUEUE_MAX_BYTES = 8 * 1024 * 1024  # ... or this many bytes of frames
 REPLAY_BATCH = 500
+BATCH_BYTES = 1024 * 1024  # replay / watcher read at most ~this much event data at a time
+SEND_TIMEOUT = 30.0  # a client that doesn't take a frame for this long is cut off
+RESUME_RE = re.compile(r"^(?:([0-9a-f]{1,32}):)?([0-9]{1,18})$", re.ASCII)
 
 ASSET_HEADERS = {
     "Cache-Control": "public, max-age=31536000, immutable",
@@ -81,21 +86,77 @@ class Locked:
             self.store.close()
 
 
-def sse_frame(event: str, data: Any, eid: int | None = None) -> bytes:
+class StalledClient(OSError):
+    """An SSE client did not accept a frame within SEND_TIMEOUT."""
+
+
+class SSEResponse(StreamingResponse):
+    """StreamingResponse with a timeout on every send: a client that stops reading (or a
+    half-open connection) is cut off instead of holding the generator and its memory."""
+
+    async def stream_response(self, send) -> None:
+        async def timed(message):
+            try:
+                await asyncio.wait_for(send(message), SEND_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise StalledClient("SSE client stopped reading") from None
+
+        try:
+            await timed({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            async for chunk in self.body_iterator:
+                await timed({"type": "http.response.body", "body": chunk, "more_body": True})
+            await timed({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            with contextlib.suppress(Exception):
+                await self.body_iterator.aclose()
+
+
+class _QuietDisconnects(logging.Filter):
+    """Don't log a traceback for every SSE client we cut off (stalled / disconnected)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        while exc is not None:
+            if isinstance(exc, StalledClient) or type(exc).__name__ == "ClientDisconnect":
+                return False
+            exc = exc.__cause__ or exc.__context__
+        return True
+
+
+logging.getLogger("uvicorn.error").addFilter(_QuietDisconnects())
+
+
+def sse_frame(event: str, data: Any, eid: int | str | None = None) -> bytes:
     head = f"id: {eid}\n" if eid is not None else ""
     return f"{head}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
 class Subscriber:
     def __init__(self) -> None:
-        # Unbounded so a close sentinel always fits; the bound is enforced in Hub.publish.
+        # Unbounded so a close sentinel always fits; the bounds (frames and bytes) are
+        # enforced in Hub.publish.
         self.queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
+        self.bytes = 0
         self.closed = False
 
     def close(self) -> None:
         if not self.closed:
             self.closed = True
             self.queue.put_nowait(None)
+
+    def drop(self) -> None:
+        """Too slow: free the buffered frames now and end the stream (it reconnects and
+        replays from its Last-Event-ID)."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.bytes = 0
+        self.closed = False
+        self.close()
+
+    def get_nowait_frame(self, item):
+        if item is not None:
+            self.bytes -= len(item[1])
+        return item
 
 
 class Hub:
@@ -115,6 +176,7 @@ class Hub:
         self.nudge = asyncio.Event()
         self.loop = asyncio.get_running_loop()
         self.last_seq = await run_in_threadpool(self.watch.current_seq)
+        self.epoch = self.watch.epoch
         self._task = asyncio.create_task(self._run(), name="board-watcher")
 
     def stop(self) -> None:
@@ -149,22 +211,18 @@ class Hub:
 
     def publish(self, eid: int, frame: bytes) -> None:
         for sub in list(self.subs):
-            if sub.queue.qsize() >= QUEUE_MAX:
+            if sub.closed:
+                self.subs.discard(sub)
+            elif sub.queue.qsize() >= QUEUE_MAX or sub.bytes + len(frame) > QUEUE_MAX_BYTES:
                 log.warning("dropping slow SSE client (queue full)")
                 self.subs.discard(sub)
-                sub.close()
+                sub.drop()
             else:
+                sub.bytes += len(frame)
                 sub.queue.put_nowait((eid, frame))
 
-    def _read_new(self) -> list[dict]:
-        out: list[dict] = []
-        seq = self.last_seq
-        while True:
-            batch = self.watch.events_after(seq, 1000)
-            out += batch
-            if len(batch) < 1000:
-                return out
-            seq = batch[-1]["id"]
+    def frame(self, e: dict) -> bytes:
+        return sse_frame(e["type"], e["data"], f"{self.epoch}:{e['id']}")
 
     async def _run(self) -> None:
         version = None
@@ -189,11 +247,15 @@ class Hub:
                 if v == version:
                     continue
                 version = v  # read before the events: a commit in between bumps it again
-                for e in await run_in_threadpool(self._read_new):
-                    if e["id"] <= self.last_seq:
-                        continue
-                    self.last_seq = e["id"]
-                    self.publish(e["id"], sse_frame(e["type"], e["data"], e["id"]))
+                while True:  # in byte-bounded batches, publishing as we go
+                    batch = await run_in_threadpool(self.watch.events_after, self.last_seq, 1000, BATCH_BYTES)
+                    if not batch:
+                        break
+                    for e in batch:
+                        if e["id"] <= self.last_seq:
+                            continue
+                        self.last_seq = e["id"]
+                        self.publish(e["id"], self.frame(e))
             except asyncio.CancelledError:
                 raise
             except Exception:  # keep watching; the next poll retries
@@ -427,7 +489,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         except ValueError:
             raise BoardError("limit must be an integer")
         posts, seq = await reader.call("list_posts", agent=agent or None, limit=n)
-        return JSONResponse({"posts": posts, "seq": seq}, headers={"X-Board-Data": str(reader.store.dir)})
+        return JSONResponse({"posts": posts, "seq": seq, "epoch": reader.store.epoch},
+                            headers={"X-Board-Data": str(reader.store.dir)})
 
     @app.get("/api/posts/{post_id}")
     async def get_post(post_id: str):
@@ -445,39 +508,46 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @app.get("/api/events")
     async def events(request: Request, since: str | None = None):
         raw = request.headers.get("last-event-id") or since
-        try:
-            resume = int(raw) if raw not in (None, "") else None
-        except ValueError:
-            raise BoardError("Last-Event-ID / since must be an integer")
-        if resume is not None:
-            resume = max(-1, min(resume, 2**62))  # out of range -> reset below, never an overflow
+        resume, epoch = None, reader.store.epoch
+        if raw not in (None, ""):
+            m = RESUME_RE.match(raw.strip())
+            if not m:
+                raise BoardError("Last-Event-ID / since must be SEQ or EPOCH:SEQ (ASCII digits)")
+            resume = int(m.group(2))
+            if m.group(1) is not None and m.group(1) != epoch:
+                resume = -1  # another database (wiped, replaced, other --data): reset
         sub = hub.subscribe()  # FIRST, so nothing committed from now on can be missed
 
         async def stream() -> AsyncIterator[bytes]:
+            loop = asyncio.get_running_loop()
             try:
                 current = await reader.call("current_seq")
-                yield b"retry: 1000\n\n" + sse_frame("hello", {"seq": current})
+                yield b"retry: 1000\n\n" + sse_frame("hello", {"seq": current, "epoch": epoch})
                 last = current if resume is None else resume
                 if resume is not None:
                     lowest = await reader.call("min_event_id")
                     if resume > current or resume < 0 or (lowest and resume < lowest - 1):
-                        yield sse_frame("reset", {"seq": current})
+                        yield sse_frame("reset", {"seq": current, "epoch": epoch})
                         last = current
                 while not hub.stopping.is_set():  # replay what the client missed, in batches
-                    batch = await reader.call("events_after", last, REPLAY_BATCH)
+                    batch = await reader.call("events_after", last, REPLAY_BATCH, BATCH_BYTES)
+                    if not batch:
+                        break
                     for e in batch:
                         if hub.stopping.is_set():
                             return
                         last = e["id"]
-                        yield sse_frame(e["type"], e["data"], e["id"])
-                    if len(batch) < REPLAY_BATCH:
-                        break
-                while True:  # live
-                    try:
-                        item = await asyncio.wait_for(sub.queue.get(), PING_INTERVAL)
-                    except asyncio.TimeoutError:
+                        yield hub.frame(e)
+                next_ping = loop.time() + PING_INTERVAL
+                while not sub.closed or not sub.queue.empty():  # live
+                    if loop.time() >= next_ping:  # on a timer, busy or not: detects dead peers
                         yield b": ping\n\n"
+                        next_ping = loop.time() + PING_INTERVAL
+                    try:
+                        item = await asyncio.wait_for(sub.queue.get(), max(0.0, next_ping - loop.time()))
+                    except asyncio.TimeoutError:
                         continue
+                    item = sub.get_nowait_frame(item)
                     if item is None:  # shutdown or dropped as too slow: client reconnects
                         return
                     eid, frame = item
@@ -489,8 +559,9 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 return
             finally:
                 hub.unsubscribe(sub)
+                sub.drop()
 
-        return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+        return SSEResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     # ------------------------------------------------------------------ page
 
