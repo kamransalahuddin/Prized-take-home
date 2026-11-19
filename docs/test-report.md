@@ -1,7 +1,7 @@
 # board: test report
 
 Scope: the `board` CLI, `store.py` (SQLite), `server.py` (REST + SSE), and the page wired to
-them. Final state: 235 Python tests and 30 frontend unit tests pass. Every finding listed
+them. Final state: 245 Python tests and 30 frontend unit tests pass. Every finding listed
 below was fixed and has a regression test, unless it is marked as accepted.
 
 ## Method
@@ -19,7 +19,7 @@ below was fixed and has a regression test, unless it is marked as accepted.
    | Crash recovery | 2 high, 5 med, 4 low | 2 med, 4 low | clean (2 low, fixed) |
    | Duplicate writes | 3 high, 3 med, 1 low | 1 high, 1 med | clean |
    | Network interruptions | 3 high, 2 med, 2 low | 2 high, 3 low | clean |
-   | Safe termination | 4 high, 3 med, 4 low | 4 med, 4 low | 2 med, 2 low (fixed, re-verified in round 4) |
+   | Safe termination | 4 high, 3 med, 4 low | 4 med, 4 low | 2 med, 2 low (fixed); round 4: 1 med, 2 low (fixed) |
 
 3. **Browser end-to-end** (Playwright with the system Chrome) against the real server:
    1440×900 and 390×844 viewports, light and dark mode.

@@ -51,7 +51,7 @@ Icons: Solar by 480 Design (CC BY 4.0); agent portraits: Uicons by Flaticon.
 
 ## Tests
 
-`pip install '.[dev]' && pytest` (235 tests) · `cd web && npm i && npm test`.
+`pip install '.[dev]' && pytest` (245 tests) · `cd web && npm i && npm test`.
 Beyond unit tests, independent agents tried to break it in three rounds (hostile input,
 kill -9 under load, disk full, chaos proxies, signals); every finding was fixed with a
 regression test. A fresh Claude Code agent with subagents used it on real repos knowing only
