@@ -33,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .store import MAX_ASSET, BoardError, Store, check_text, loads_strict
+from .store import MAX_ASSET, MAX_DEPTH, BoardError, Store, check_text, loads_strict
 
 log = logging.getLogger("board.server")
 
@@ -46,6 +46,8 @@ QUEUE_MAX_BYTES = 8 * 1024 * 1024  # ... or this many bytes of frames
 REPLAY_BATCH = 500
 BATCH_BYTES = 1024 * 1024  # replay / watcher read at most ~this much event data at a time
 SEND_TIMEOUT = 30.0  # a client that doesn't take a frame for this long is cut off
+LIMIT_RE = re.compile(r"^[0-9]{1,9}$", re.ASCII)
+STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT") if hasattr(signal, n))
 RESUME_RE = re.compile(r"^(?:([0-9a-f]{1,32}):)?([0-9]{1,18})$", re.ASCII)
 
 ASSET_HEADERS = {
@@ -161,6 +163,15 @@ class _QuietDisconnects(logging.Filter):
 
 
 logging.getLogger("uvicorn.error").addFilter(_QuietDisconnects())
+
+
+def ping_frame() -> bytes:
+    """A named event (no id: Last-Event-ID is unaffected): EventSource hides `:` comments
+    from scripts, so a page can only run a "no data for 45 s -> reconnect" watchdog on
+    events it can see."""
+    import time
+
+    return sse_frame("ping", {"t": int(time.time())})
 
 
 def sse_frame(event: str, data: Any, eid: int | str | None = None) -> bytes:
@@ -306,7 +317,8 @@ def _err(message: str, status: int) -> JSONResponse:
 
 def _install_shutdown_hook(hub: Hub) -> Callable[[], None]:
     """Uvicorn waits for open responses before shutting down; SSE streams never end on
-    their own. Chain onto uvicorn's SIGINT/SIGTERM handlers so the streams close at once."""
+    their own. Chain onto uvicorn's handlers (SIGINT/SIGTERM, and SIGHUP/SIGQUIT when
+    `board serve` asked uvicorn to handle them) so the streams close at once."""
     if threading.current_thread() is not threading.main_thread():
         return lambda: None
     previous: dict[int, Any] = {}
@@ -319,7 +331,9 @@ def _install_shutdown_hook(hub: Hub) -> Callable[[], None]:
         elif prev == signal.SIG_DFL and sig == signal.SIGINT:
             raise KeyboardInterrupt
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in STOP_SIGNALS:
+        if sig not in (signal.SIGINT, signal.SIGTERM) and not callable(signal.getsignal(sig)):
+            continue  # only chain HUP/QUIT if the server handles them (board serve)
         try:
             previous[sig] = signal.getsignal(sig)
             signal.signal(sig, handler)
@@ -421,7 +435,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             text = bytes(body or b"null").decode("utf-8")
         except UnicodeDecodeError as e:
             raise BoardError(f"invalid JSON body: not UTF-8 ({e})")
-        data = loads_strict(text, "invalid JSON body")
+        data = loads_strict(text, "invalid JSON body", depth=MAX_DEPTH + 3)  # body > payload > value
         if not isinstance(data, dict):
             raise BoardError("request body must be a JSON object")
         return data
@@ -479,6 +493,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             done=opt_bool(d, "done"),
             exit_code=exit_code,
             newline=opt_bool(d, "newline"),
+            raw=opt_bool(d, "raw"),
             expect_kind=opt_str(d, "expect_kind"),
             expect_gen=opt_str(d, "expect_gen"),
             request_id=opt_str(d, "request_id"),
@@ -520,10 +535,9 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
 
     @app.get("/api/posts")
     async def list_posts(agent: str | None = None, limit: str = "200"):
-        try:
-            n = int(limit)
-        except ValueError:
-            raise BoardError("limit must be an integer")
+        if not LIMIT_RE.match(limit):
+            raise BoardError("limit must be a positive integer (ASCII digits)")
+        n = int(limit)
         posts, seq = await reader.call("list_posts", agent=agent or None, limit=n)
         return JSONResponse({"posts": posts, "seq": seq, "epoch": reader.store.epoch},
                             headers={"X-Board-Data": str(reader.store.dir)})
@@ -577,7 +591,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 next_ping = loop.time() + PING_INTERVAL
                 while not sub.closed or not sub.queue.empty():  # live
                     if loop.time() >= next_ping:  # on a timer, busy or not: detects dead peers
-                        yield b": ping\n\n"
+                        yield ping_frame()
                         next_ping = loop.time() + PING_INTERVAL
                     try:
                         item = await asyncio.wait_for(sub.queue.get(), max(0.0, next_ping - loop.time()))

@@ -320,7 +320,7 @@ def test_events_pruned_and_small_request_results(store, monkeypatch):
     assert store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] < 1000
     assert store.min_event_id() > 1
     stored = json.loads(store.conn.execute("SELECT result FROM requests WHERE id='big'").fetchone()[0])
-    assert stored["result"] == {"id": p["id"], "created": True}
+    assert stored["result"] == {"id": p["id"], "created": True, "gen": p["gen"]}
     again, created = store.create_post("x", "log", {}, live=True, request_id="big")
     assert again["id"] == p["id"] and created and again["payload"]["text"].startswith("0\n")
 

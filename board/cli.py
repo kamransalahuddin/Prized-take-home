@@ -33,9 +33,11 @@ from board.store import (
     Store,
     StoreBusy,
     default_data_dir,
+    env_seconds,
     loads_strict,
     normalize_agent,
     normalize_key,
+    normalize_payload,
     normalize_status,
     normalize_table,
     proc_start,
@@ -43,7 +45,7 @@ from board.store import (
 )
 
 FLUSH_INTERVAL = 0.25
-FINISH_PATIENCE = float(os.environ.get("BOARD_FINISH_PATIENCE", 60))  # retry final chunk while board is down
+FINISH_PATIENCE = env_seconds("BOARD_FINISH_PATIENCE", 60)  # retry final chunk while board is down
 FLUSH_BYTES = 256 * 1024
 MAX_PENDING = 10 * 1024 * 1024
 MAX_CHUNK = 1024 * 1024  # characters per streamed append (well under the 8 MB body limit)
@@ -51,16 +53,20 @@ HINT = "Run 'board help' for usage."
 # One-shot HTTP writes retry transient failures (connection errors, timeouts, 5xx) with the
 # SAME request_id for this long: a slow request may still commit, and the retry then returns
 # the stored result instead of writing twice.
-WRITE_PATIENCE = float(os.environ.get("BOARD_WRITE_PATIENCE", 20))
-MIN_ATTEMPTS = 4  # ... and at least this many tries
+WRITE_PATIENCE = env_seconds("BOARD_WRITE_PATIENCE", 20)
+MIN_ATTEMPTS = 4  # ... and at least this many tries (unless that takes 3x the patience)
+READ_PATIENCE = 5.0  # `board ls` over HTTP: a read can just be run again
+CONNECT_TIMEOUT = 3.0  # HTTP: no connection within this -> the server is not reachable
+READ_TIMEOUT = 30.0  # ... but a slow answer is waited for (the write may be committing)
 CREATE_WAIT = 3.0  # `board log` starts the command after this even if the post isn't created yet
 INTERRUPT_PATIENCE = 10.0  # posting the rest of the output after a SIGINT/SIGTERM/SIGHUP
 KILL_GRACE = 5.0  # after forwarding a stop signal, SIGKILL the child's group if still running
+GROUP_GRACE = 1.0  # after a stopped child exits: TERM its leftover group, KILL after this
 DRAIN_AFTER_EXIT = 1.0  # read the pipe this long after the child exits (grandchildren may hold it)
 STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT") if hasattr(signal, n))
 WAIT_POLL_LOCAL = 0.5
 WAIT_POLL_HTTP = 1.0
-SERVER_ERROR_PATIENCE = float(os.environ.get("BOARD_SERVER_ERROR_PATIENCE", 30))  # wait: give up on 5xx
+SERVER_ERROR_PATIENCE = env_seconds("BOARD_SERVER_ERROR_PATIENCE", 30)  # wait: give up on 5xx
 EXIT_TIMEOUT = 4
 POST_ID_RE = re.compile(r"^p_[a-z2-7]{4,16}$")
 REAP_EVERY = 60.0  # direct mode: close orphaned live logs at most this often (any command)
@@ -93,6 +99,20 @@ class Unreachable(Transient):
 
 class ServerError(Transient):
     """The server answered 5xx (or 408/429): exit 1 once retries are exhausted."""
+
+    def __init__(self, message: str, status: int | None = None, request_id: str | None = None):
+        super().__init__(message, status)
+        self.request_id = request_id
+
+
+class MaybeApplied(Transient):
+    """A write reached the server but no answer came back (read timeout, connection dropped
+    after sending): it may have been applied. Exit 1 once retries are exhausted."""
+
+    def __init__(self, url: str, cause: str, request_id: str | None):
+        super().__init__(f"BOARD_URL {url} did not answer ({cause}); the write may already have been "
+                         f"applied (request id {request_id}); check with board ls before repeating it")
+        self.request_id = request_id
 
 
 def is_transient(e: BaseException) -> bool:
@@ -140,8 +160,12 @@ def clean(s: str | None) -> str | None:
 
 
 class LocalBackend:
-    def __init__(self, data_dir: Path | None = None):
-        self.store = Store(data_dir or default_data_dir())
+    def __init__(self, data_dir: Path | None = None, read_only: bool = False):
+        d = data_dir or default_data_dir()
+        db = d.expanduser() / "board.db"
+        # A read command on a database this user cannot write still works (read-only).
+        ro = read_only and db.is_file() and not (os.access(db, os.W_OK) and os.access(db.parent, os.W_OK))
+        self.store = Store(d, readonly=ro)
 
     def create_post(self, patience: float | None = None, **kw) -> tuple[dict, bool]:
         return self.store.create_post(**kw)
@@ -169,6 +193,8 @@ class LocalBackend:
     def maybe_reap(self) -> None:
         """Close live logs whose `board log` died without reporting (kill -9) even when no
         server runs; at most once a minute across all processes, never failing the command."""
+        if self.store.readonly:
+            return
         marker = self.store.dir / ".reaped"
         try:
             if time.time() - marker.stat().st_mtime < REAP_EVERY:
@@ -188,48 +214,66 @@ class HttpBackend:
 
         self.httpx = httpx
         self.url = url.rstrip("/")
-        self.client = httpx.Client(base_url=self.url, timeout=httpx.Timeout(10.0, connect=5.0))
+        self.client = httpx.Client(base_url=self.url,
+                                   timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT))
 
-    def _req(self, method: str, path: str, **kw) -> Any:
+    def _unreachable(self, e: BaseException) -> Unreachable:
+        return Unreachable(f"cannot reach BOARD_URL {self.url}: {e or type(e).__name__}. "
+                           "Start board serve there, or unset BOARD_URL to save posts locally.")
+
+    def _req(self, method: str, path: str, request_id: str | None = None, **kw) -> Any:
+        httpx = self.httpx
         try:
             r = self.client.request(method, path, **kw)
-        except self.httpx.TransportError as e:
-            raise Unreachable(f"cannot reach BOARD_URL {self.url}: {e or type(e).__name__}. "
-                              "Start board serve there, or unset BOARD_URL to save posts locally.") from e
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.UnsupportedProtocol) as e:
+            raise self._unreachable(e) from e  # never sent: nothing was applied
+        except httpx.TransportError as e:
+            if method == "POST":  # sent (at least partly), no answer: may have been applied
+                raise MaybeApplied(self.url, str(e) or type(e).__name__, request_id) from e
+            raise Unreachable(f"BOARD_URL {self.url} did not answer: {e or type(e).__name__}") from e
         if r.status_code >= 400:
             try:
                 msg = r.json().get("error") or r.text
             except (ValueError, AttributeError):
                 msg = r.text.strip()[:200] or r.reason_phrase
             if r.status_code >= 500 or r.status_code in (408, 429):
-                raise ServerError(f"{msg} (HTTP {r.status_code})", r.status_code)
+                raise ServerError(f"{msg} (HTTP {r.status_code})", r.status_code,
+                                  request_id if method == "POST" else None)
             raise BoardError(f"{msg} (HTTP {r.status_code})", r.status_code)
         try:
             return r.json()
         except ValueError as e:
             raise BoardError(f"BOARD_URL {self.url} did not answer like a board server", 502) from e
 
-    def _retrying(self, patience: float | None, fn: Callable[[], Any]) -> Any:
+    def _retrying(self, patience: float | None, fn: Callable[[], Any], request_id: str | None = None) -> Any:
         """Call fn, retrying transient failures (with backoff) until `patience` seconds have
         passed (and, with patience > 0, at least MIN_ATTEMPTS tries: a request that timed out
         may still have committed, so slow attempts must not use up all the tries); then
-        re-raise the last one. Writes keep their request_id on every retry."""
+        re-raise the last one. Writes keep their request_id on every retry. If any attempt
+        of a write reached the server, the final error says it may have been applied."""
         patience = WRITE_PATIENCE if patience is None else patience
-        start, delay, attempts = time.monotonic(), 0.25, 0
+        start, delay, attempts, reached = time.monotonic(), 0.25, 0, None
         while True:
             try:
                 attempts += 1
                 return fn()
-            except Transient:
-                if time.monotonic() - start >= patience and (patience <= 0 or attempts >= MIN_ATTEMPTS):
+            except Transient as e:
+                if isinstance(e, MaybeApplied):
+                    reached = e
+                elapsed = time.monotonic() - start
+                if elapsed >= patience and (patience <= 0 or attempts >= MIN_ATTEMPTS or elapsed >= 3 * patience):
+                    if reached is not None and isinstance(e, Unreachable):
+                        raise reached from e  # down now, but an earlier try got through
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 2.0)
 
-    def _write(self, path: str, body: dict | None = None, patience: float | None = None, **kw) -> Any:
+    def _write(self, path: str, body: dict | None = None, patience: float | None = None,
+               request_id: str | None = None, **kw) -> Any:
         if body is not None:
             kw["json"] = body
-        return self._retrying(patience, lambda: self._req("POST", path, **kw))
+            request_id = request_id or body.get("request_id")
+        return self._retrying(patience, lambda: self._req("POST", path, request_id, **kw), request_id)
 
     def create_post(self, patience: float | None = None, **kw) -> tuple[dict, bool]:
         body = {k: v for k, v in kw.items() if v is not None}
@@ -252,7 +296,7 @@ class HttpBackend:
     def add_asset(self, data: bytes, request_id: str | None = None) -> dict:
         rid = request_id or new_request_id()
         return self._write("/api/assets", files={"file": ("image", data)}, data={"request_id": rid},
-                           headers={"X-Request-Id": rid})
+                           headers={"X-Request-Id": rid}, request_id=rid)
 
     def get_post(self, post_id: str, patience: float | None = None) -> dict:
         return self._retrying(patience, lambda: self._req("GET", f"/api/posts/{post_id}"))
@@ -261,15 +305,15 @@ class HttpBackend:
         params: dict = {"limit": limit}
         if agent:
             params["agent"] = agent
-        return self._retrying(None, lambda: self._req("GET", "/api/posts", params=params))["posts"]
+        return self._retrying(READ_PATIENCE, lambda: self._req("GET", "/api/posts", params=params))["posts"]
 
     def maybe_reap(self) -> None:
         pass  # the server reaps
 
 
-def backend():
+def backend(read_only: bool = False):
     url = os.environ.get("BOARD_URL", "").strip()
-    return HttpBackend(url) if url else LocalBackend()
+    return HttpBackend(url) if url else LocalBackend(read_only=read_only)
 
 
 # ---------------------------------------------------------------- input helpers
@@ -317,10 +361,12 @@ def read_value(v: str) -> str:
         return read_stdin_bytes().decode("utf-8", "replace")
     if v.startswith("@") and len(v) > 1:
         path = v[1:]
+        if not is_file(path) and path.strip() != path and is_file(path.strip()):
+            path = path.strip()  # "@ notes/x.md": the space after @ is not part of the name
         if is_file(path):
             return read_file_bytes(path).decode("utf-8", "replace")
-        if looks_like_path(path):
-            raise InputError(f"file not found: {path} (to post text starting with @, pipe it in with -)")
+        if looks_like_path(path.strip()):
+            raise InputError(f"file not found: {path.strip()} (to post text starting with @, pipe it in with -)")
     return v
 
 
@@ -363,7 +409,7 @@ def title_text(title: str | None) -> str | None:
 
 def post_id_arg(post_id: str) -> str:
     if not POST_ID_RE.match(post_id):
-        raise InputError(f"bad post ID {post_id!r}: IDs look like p_3f9k2a (printed by board post)")
+        raise InputError(f"bad post ID {post_id!r}: IDs look like p_3f9k2a7q (printed by board post)")
     return post_id
 
 
@@ -409,8 +455,12 @@ class Streamer:
 
     def __init__(self, be, post_id: str | None, echo: bool, expect_kind: str | None = None,
                  expect_gen: str | None = None, create: dict | None = None,
-                 on_created: Callable[[dict], None] | None = None):
+                 on_created: Callable[[dict], None] | None = None, continuation: bool = False):
         self.be = be
+        # text/markdown streams: only the first chunk is joined with a separator; later
+        # chunks continue it verbatim (append raw=True), wherever the flushes fall.
+        self.continuation = continuation
+        self.started = False
         self.expect_kind = expect_kind
         self.expect_gen = expect_gen
         self.post_id = post_id
@@ -431,7 +481,7 @@ class Streamer:
         self.last_error: BaseException | None = None
         self.warned = False
         self.dropped = False
-        self.inflight: tuple[str, str] | None = None  # (request_id, text) awaiting success
+        self.inflight: tuple[str, str, dict] | None = None  # (request_id, text, kw) awaiting success
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -530,6 +580,14 @@ class Streamer:
                 return self._retry_later(e)
             return self._fail(e, f"stopped posting output to {self.post_id}")
 
+    def _chunk_kw(self, text: str) -> dict:
+        """Fixed when the chunk is made (it is part of the chunk's identity on retries)."""
+        if not text:
+            return {}
+        kw = {"raw": True} if self.continuation and self.started else {}
+        self.started = True
+        return kw
+
     def _step(self) -> bool:
         if self.post_id is None:
             return self._create()
@@ -537,8 +595,9 @@ class Streamer:
             text = self._take(final=False)
             if not text:
                 return True
-            self.inflight = (new_request_id(), text)
-        if self._send(*self.inflight):
+            self.inflight = (new_request_id(), text, self._chunk_kw(text))
+        rid, text, kw = self.inflight
+        if self._send(rid, text, **kw):
             self.inflight = None
             return True
         return False
@@ -592,10 +651,11 @@ class Streamer:
             text = "[board: output was dropped while the board was unreachable]\n" + text
         chunks: list[tuple[str, str, dict]] = []
         if self.inflight is not None:  # never merged with newer text: it keeps its id
-            chunks.append((*self.inflight, {}))
+            chunks.append(self.inflight)
         pieces = [text[i:i + MAX_CHUNK] for i in range(0, len(text), MAX_CHUNK)]
         for i, piece in enumerate(pieces):
-            chunks.append((new_request_id(), piece, final_kw if i == len(pieces) - 1 else {}))
+            chunks.append((new_request_id(), piece,
+                           {**self._chunk_kw(piece), **(final_kw if i == len(pieces) - 1 else {})}))
         if not pieces and final_kw:
             chunks.append((new_request_id(), "", final_kw))
         for n, (rid, chunk, kw) in enumerate(chunks):
@@ -630,9 +690,15 @@ def pump(fd: int, streamer: Streamer, should_stop: Callable[[], bool] = lambda: 
         streamer.feed(data)
 
 
+KEEP_SIGNAL_HANDLERS = False  # set by main(): the process exits right after the command
+
+
 class StopSignals:
     """Handle SIGINT/SIGTERM/SIGHUP/SIGQUIT while board streams: remember them and call
-    `on_signal(signum)`; restore the old handlers on exit."""
+    `on_signal(signum)`. On exit the old handlers are restored, except in the real CLI
+    process (KEEP_SIGNAL_HANDLERS): there a late signal in a storm must not kill board
+    with the default action between the command finishing and the exit (exit 128+N of
+    the first signal, always)."""
 
     def __init__(self, on_signal: Callable[[int], None]):
         self.on_signal = on_signal
@@ -652,6 +718,8 @@ class StopSignals:
         return self
 
     def __exit__(self, *exc) -> None:
+        if KEEP_SIGNAL_HANDLERS:
+            return
         for sig, h in self.old.items():
             try:
                 signal.signal(sig, h)
@@ -696,6 +764,17 @@ QuietOpt = Annotated[bool, typer.Option("-q", "--quiet")]
 @app.command("help")
 def help_cmd() -> None:
     out(HELP.rstrip("\n"))
+
+
+def check_payload(kind: str, payload: dict) -> None:
+    """Validate with the store's own rules before writing or sending, so a bad value is
+    exit 2 in both modes (never a traceback while encoding the HTTP body)."""
+    try:
+        normalize_payload(kind, payload)
+    except BoardError as e:
+        if e.status == 413:
+            raise  # too large: rejected (exit 1)
+        raise InputError(e.message) from e
 
 
 def parse_chart(raw: str) -> dict:
@@ -755,6 +834,7 @@ def post_cmd(
             kind, payload = "markdown", {"markdown": read_value(md)}
         else:
             kind, payload = "text", {"text": read_value(sources[0])}
+        check_payload(kind, payload)
         be = backend()
     post, created = be.create_post(agent=a, kind=kind, payload=payload, title=title, status=s, key=k)
     post["created"] = created
@@ -762,11 +842,33 @@ def post_cmd(
     be.maybe_reap()
 
 
+def end_group(pgid: int) -> None:
+    """After a stop signal: the child exited, but members of its process group may live on
+    (`sh -c 'sleep 100 & wait'`: background jobs ignore SIGINT/SIGQUIT). TERM the group,
+    then KILL it if anything is still there after GROUP_GRACE s."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return  # nothing left
+    deadline = time.monotonic() + GROUP_GRACE
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def run_child(cmd: List[str], streamer: Streamer) -> int:
     """Run CMD in its own process group with output into the streamer; return its exit
     code (128+N if killed by signal N). Stop signals received by board are forwarded to
     the whole group exactly once; if the child is still running KILL_GRACE s after one,
-    the group is killed. Returns once the child itself exits (after draining the pipe for
+    the group is killed; once a stopped child exits, the rest of its group is ended too.
+    Returns once the child itself exits (after draining the pipe for
     up to DRAIN_AFTER_EXIT s), even if background grandchildren keep the pipe open."""
     state: dict[str, Any] = {"proc": None, "pending": [], "kill_at": None, "exited": False}
 
@@ -795,6 +897,10 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
             streamer.finish(patience=INTERRUPT_PATIENCE, done=True, exit_code=rc)
             return rc
         env = dict(os.environ, PYTHONUNBUFFERED="1")
+        # CMD has no stdin or terminal: make git fail fast instead of waiting on an editor
+        # or a password prompt nobody can answer.
+        env.setdefault("GIT_EDITOR", "true")
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -828,6 +934,8 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
                         pass
                     state["kill_at"], killed = float("inf"), True
         state["exited"] = True
+        if sigs.got:  # stopped: also end what it left running in its group
+            end_group(proc.pid)
         reader.join(DRAIN_AFTER_EXIT)
         if reader.is_alive():  # a background grandchild holds the pipe: stop reading
             stop_reading.set()
@@ -944,7 +1052,8 @@ def append_stream(post_id: str, s: str | None, title: str | None, as_json: bool,
         warn(f"{err_text(e)}; passing output through without posting")
         be = None
     streamer = Streamer(be, post_id if be else None, echo=not quiet,
-                        expect_kind=post["kind"] if post else None, expect_gen=post.get("gen") if post else None)
+                        expect_kind=post["kind"] if post else None, expect_gen=post.get("gen") if post else None,
+                        continuation=bool(post) and post["kind"] in ("text", "markdown"))
     streamer.start()
     got = stream_input(sys.stdin.fileno(), streamer)
     final = {k: v for k, v in (("status", s), ("title", title)) if v is not None}
@@ -1080,13 +1189,17 @@ def wait_cmd(
 @app.command("ls")
 def ls_cmd(
     agent: AgentOpt = None,
-    limit: Annotated[int, typer.Option("-n", "--limit")] = 20,
+    limit: Annotated[int, typer.Option("-n", "--limit", min=1)] = 20,
     as_json: JsonOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
     if agent is not None:
-        agent = agent_name(agent.strip().rstrip("/"))
-    be = backend()
+        a = agent.strip().rstrip("/")
+        if not a:
+            raise InputError(f"bad agent name {agent!r}: use lowercase letters, digits, . _ - and / "
+                             "for subagents (e.g. lead/tests)")
+        agent = agent_name(a)
+    be = backend(read_only=True)
     posts = be.list_posts(agent, limit)
     be.maybe_reap()
     if quiet:
@@ -1113,6 +1226,7 @@ def serve_cmd(
     as_json: JsonOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
+    ensure_std_fds()
     import httpx
 
     data_dir = (data or default_data_dir()).expanduser()
@@ -1142,9 +1256,19 @@ def serve_cmd(
             # previous server must not block a restart; a live listener still fails.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
+    except socket.gaierror as e:
+        raise BoardError(f"cannot listen on {host}:{port}: unknown host name ({e.strerror or e}). "
+                         "Use an address such as 127.0.0.1 or 0.0.0.0 with --host.") from e
     except OSError as e:
-        raise BoardError(f"cannot listen on {host}:{port}: {e.strerror or e}. "
-                         "Another program may be using it; pick another with --port N.") from e
+        if e.errno == errno.EADDRINUSE:
+            hint = "Another program is using it; pick another with --port N."
+        elif e.errno == errno.EADDRNOTAVAIL:
+            hint = "That address is not on this machine; use 127.0.0.1 or 0.0.0.0 with --host."
+        elif e.errno == errno.EACCES:
+            hint = "Not allowed (ports below 1024 need root); pick another with --port N."
+        else:
+            hint = "Pick another --port N or --host."
+        raise BoardError(f"cannot listen on {host}:{port}: {e.strerror or e}. {hint}") from e
 
     import uvicorn
 
@@ -1157,14 +1281,43 @@ def serve_cmd(
              "Prefer an SSH tunnel (ssh -L 8000:localhost:8000 host).")
     serve_out(url, data_dir, as_json, quiet)
 
+    import uvicorn.server
+
+    # SIGHUP (terminal closed) and SIGQUIT shut down cleanly too (WAL checkpoint), exit 0.
+    extra = tuple(getattr(signal, n) for n in ("SIGHUP", "SIGQUIT") if hasattr(signal, n))
+    uvicorn.server.HANDLED_SIGNALS = tuple(dict.fromkeys(uvicorn.server.HANDLED_SIGNALS + extra))
+
     class Server(uvicorn.Server):
-        def handle_exit(self, sig, frame):  # SIGINT and SIGTERM both shut down cleanly, exit 0
+        def handle_exit(self, sig, frame):  # INT/TERM/HUP/QUIT all shut down cleanly, exit 0
             super().handle_exit(sig, frame)
             self._captured_signals.clear()  # (uvicorn would re-raise the signal afterwards)
 
     config = uvicorn.Config(application, host=host, port=port, workers=1, timeout_graceful_shutdown=2,
                             log_level="warning")
     Server(config).run()
+
+
+def ensure_std_fds() -> None:
+    """`board serve >&-`: give closed stdout/stderr a /dev/null so uvicorn's logging (and
+    our own prints) work instead of crashing on a missing stream."""
+    for fd, name in ((1, "stdout"), (2, "stderr")):
+        try:
+            os.fstat(fd)
+            ok = True
+        except OSError:
+            ok = False
+            try:
+                null = os.open(os.devnull, os.O_WRONLY)
+                if null != fd:
+                    os.dup2(null, fd)
+                    os.close(null)
+            except OSError:
+                continue
+        if not ok or getattr(sys, name) is None:
+            try:
+                setattr(sys, name, open(fd, "w", buffering=1, closefd=False))
+            except OSError:
+                pass
 
 
 def serve_out(url: str, data_dir: Path, as_json: bool, quiet: bool) -> None:
@@ -1260,7 +1413,12 @@ def run(args: list[str]) -> int:
         warn(e.message)
         return 3
     except ServerError as e:
-        warn(f"the board server failed: {e.message}")
+        hint = (f"; the write may already have been applied (request id {e.request_id}): check with "
+                "board ls before repeating it") if e.request_id else ""
+        warn(f"the board server failed: {e.message}{hint}")
+        return 1
+    except MaybeApplied as e:
+        warn(e.message)
         return 1
     except KeyboardInterrupt:
         return 130
@@ -1295,6 +1453,8 @@ def warn_hint() -> None:
 
 
 def main() -> None:
+    global KEEP_SIGNAL_HANDLERS
+    KEEP_SIGNAL_HANDLERS = True
     code = run(sys.argv[1:])
     try:
         sys.stdout.flush()
