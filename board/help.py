@@ -52,7 +52,7 @@ LOGS (live, growing output)
   Both take -t, -s, -k like post, print the ID first and copy the output
   to stderr (so id=$(board log ...) captures only the ID; colour codes
   are stripped on the board). Run long commands in the background.
-  CMD gets no stdin or terminal: use -m, --yes or GIT_EDITOR=true.
+  CMD has no stdin or terminal: use -m, --yes (git gets GIT_EDITOR=true).
   board append ID TEXT     add text to a log, text or Markdown post
                            (TEXT can also be - or @path)
   board append ID -s ok    change a post's status (or -t its title);

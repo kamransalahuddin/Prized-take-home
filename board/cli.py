@@ -253,7 +253,14 @@ class HttpBackend:
         except ValueError as e:
             raise BoardError(f"BOARD_URL {self.url} did not answer like a board server", 502) from e
 
-    def _retrying(self, patience: float | None, fn: Callable[[], Any], request_id: str | None = None) -> Any:
+    def _read_timeout(self, seconds: float) -> Any:
+        """Timeouts for a read that must give up within about `seconds` (ls, wait's polls):
+        a server that accepts the connection but never answers must not hold it for the
+        full READ_TIMEOUT."""
+        return self.httpx.Timeout(min(READ_TIMEOUT, max(0.5, seconds)), connect=CONNECT_TIMEOUT)
+
+    def _retrying(self, patience: float | None, fn: Callable[[], Any], request_id: str | None = None,
+                  min_attempts: int = MIN_ATTEMPTS) -> Any:
         """Call fn, retrying transient failures (with backoff) until `patience` seconds have
         passed (and, with patience > 0, at least MIN_ATTEMPTS tries: a request that timed out
         may still have committed, so slow attempts must not use up all the tries); then
@@ -269,7 +276,7 @@ class HttpBackend:
                 if isinstance(e, MaybeApplied):
                     reached = e
                 elapsed = time.monotonic() - start
-                if elapsed >= patience and (patience <= 0 or attempts >= MIN_ATTEMPTS or elapsed >= 3 * patience):
+                if elapsed >= patience and (patience <= 0 or attempts >= min_attempts or elapsed >= 3 * patience):
                     if reached is not None and isinstance(e, Unreachable):
                         raise reached from e  # down now, but an earlier try got through
                     raise
@@ -306,14 +313,20 @@ class HttpBackend:
         return self._write("/api/assets", files={"file": ("image", data)}, data={"request_id": rid},
                            headers={"X-Request-Id": rid}, request_id=rid)
 
-    def get_post(self, post_id: str, patience: float | None = None) -> dict:
-        return self._retrying(patience, lambda: self._req("GET", f"/api/posts/{post_id}"))
+    def get_post(self, post_id: str, patience: float | None = None, read_timeout: float | None = None) -> dict:
+        kw = {} if read_timeout is None else {"timeout": self._read_timeout(read_timeout)}
+        return self._retrying(patience, lambda: self._req("GET", f"/api/posts/{post_id}", **kw))
 
     def list_posts(self, agent: str | None, limit: int) -> list[dict]:
         params: dict = {"limit": limit}
         if agent:
             params["agent"] = agent
-        return self._retrying(READ_PATIENCE, lambda: self._req("GET", "/api/posts", params=params))["posts"]
+        # A read can simply be run again: give up READ_PATIENCE s after the start, however
+        # the time went (refused connections retried, or one request nobody answers).
+        deadline = time.monotonic() + READ_PATIENCE
+        return self._retrying(READ_PATIENCE, lambda: self._req(
+            "GET", "/api/posts", params=params, timeout=self._read_timeout(deadline - time.monotonic())),
+            min_attempts=1)["posts"]
 
     def maybe_reap(self) -> None:
         pass  # the server reaps
@@ -727,21 +740,60 @@ KEEP_SIGNAL_HANDLERS = False  # set by main(): the process exits right after the
 
 class StopSignals:
     """Handle SIGINT/SIGTERM/SIGHUP/SIGQUIT while board streams: remember them and call
-    `on_signal(signum)`. On exit the old handlers are restored, except in the real CLI
-    process (KEEP_SIGNAL_HANDLERS): there a late signal in a storm must not kill board
-    with the default action between the command finishing and the exit (exit 128+N of
-    the first signal, always)."""
+    `on_signal(signum)` for each, in order, from a watcher thread. The handler itself
+    only appends the number to `got` and writes a byte to a self-pipe: no locks, no Event
+    methods, nothing that can block or recurse, so nested handlers in a signal storm can
+    neither deadlock nor overflow the stack. On exit the watcher finishes the signals
+    already received and the old handlers are restored, except in the real CLI process
+    (KEEP_SIGNAL_HANDLERS): there a late signal in a storm must not kill board with the
+    default action before main() exits (exit 128+N of the first signal, always)."""
 
     def __init__(self, on_signal: Callable[[int], None]):
         self.on_signal = on_signal
         self.got: list[int] = []
         self.old: dict[int, Any] = {}
+        self.wfd: int | None = None
+        self.rfd: int | None = None
+        self.done = 0  # signals passed to on_signal so far
+        self.closing = False
+        self.watcher: threading.Thread | None = None
 
     def _handler(self, signum, _frame) -> None:
         self.got.append(signum)
-        self.on_signal(signum)
+        wfd = self.wfd
+        if wfd is not None:
+            try:
+                os.write(wfd, b"\0")
+            except OSError:  # pipe full (a wakeup is pending anyway) or closed
+                pass
+
+    def _dispatch(self) -> None:
+        while self.done < len(self.got):
+            signum = self.got[self.done]
+            self.done += 1
+            try:
+                self.on_signal(signum)
+            except Exception:
+                pass
+
+    def _watch(self) -> None:
+        while True:
+            try:
+                os.read(self.rfd, 4096)
+            except InterruptedError:
+                continue
+            except OSError:
+                return
+            self._dispatch()
+            if self.closing:
+                return
 
     def __enter__(self) -> "StopSignals":
+        self.rfd, wfd = os.pipe()
+        os.set_blocking(wfd, False)
+        self.watcher = threading.Thread(target=self._watch, daemon=True)
+        self.watcher.start()
+        self.wfd = wfd
         for sig in STOP_SIGNALS:
             try:
                 self.old[sig] = signal.signal(sig, self._handler)
@@ -750,12 +802,26 @@ class StopSignals:
         return self
 
     def __exit__(self, *exc) -> None:
-        if KEEP_SIGNAL_HANDLERS:
+        if not KEEP_SIGNAL_HANDLERS:
+            for sig, h in self.old.items():
+                try:
+                    signal.signal(sig, h)
+                except (ValueError, OSError, TypeError):
+                    pass
+        self.closing = True
+        wfd, self.wfd = self.wfd, None  # (a kept handler then only records the signal)
+        try:
+            os.write(wfd, b"\0")
+        except OSError:
+            pass
+        self.watcher.join(5.0)
+        if self.watcher.is_alive():  # on_signal stuck: leave the fds to the daemon thread
             return
-        for sig, h in self.old.items():
+        self._dispatch()
+        for fd in (wfd, self.rfd):
             try:
-                signal.signal(sig, h)
-            except (ValueError, OSError, TypeError):
+                os.close(fd)
+            except OSError:
                 pass
 
 
@@ -903,6 +969,7 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
     Returns once the child itself exits (after draining the pipe for
     up to DRAIN_AFTER_EXIT s), even if background grandchildren keep the pipe open."""
     state: dict[str, Any] = {"proc": None, "pending": [], "kill_at": None, "exited": False}
+    lock = threading.Lock()  # on_signal runs in StopSignals' watcher thread (never in a handler)
 
     def forward(signum: int) -> None:
         try:
@@ -913,29 +980,36 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
             state["kill_at"] = time.monotonic() + KILL_GRACE
 
     def on_signal(signum: int) -> None:
-        if state["exited"]:  # child gone: don't touch background leftovers; stop retrying
-            streamer.abort.set()
-        elif state["proc"] is None:
-            state["pending"].append(signum)  # replayed right after spawn
-        else:
-            forward(signum)
+        with lock:
+            if state["exited"]:  # child gone: don't touch background leftovers; stop retrying
+                streamer.abort.set()
+            elif state["proc"] is None:
+                state["pending"].append(signum)  # replayed right after spawn
+            else:
+                forward(signum)
 
     with StopSignals(on_signal) as sigs:
         if not streamer.created.wait(CREATE_WAIT) and not sigs.got:
             warn("the board is slow to answer; running the command anyway "
                  "(the log post ID is printed once it exists)")
         if sigs.got:  # stopped before the command started: don't start it
+            with lock:
+                state["exited"] = True  # (a further signal then stops the final retry)
             rc = 128 + sigs.got[0]
             streamer.finish(patience=INTERRUPT_PATIENCE, done=True, exit_code=rc)
             return rc
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
         # CMD has no stdin or terminal: make git fail fast instead of waiting on an editor
-        # or a password prompt nobody can answer.
-        env.setdefault("GIT_EDITOR", "true")
-        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        # or a password prompt nobody can answer, even if the user exported an editor.
+        # (EDITOR/VISUAL are left alone: other tools may use them non-interactively.)
+        env = dict(os.environ, PYTHONUNBUFFERED="1", GIT_EDITOR="true", GIT_SEQUENCE_EDITOR="true",
+                   GIT_TERMINAL_PROMPT="0")
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, env=env, start_new_session=True)
+            with lock:
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                state["proc"] = proc
+                for signum in state.pop("pending"):
+                    forward(signum)
         except OSError as e:
             rc = 127 if isinstance(e, FileNotFoundError) else 126
             msg = f"cannot run {cmd[0]}: {e.strerror or e}"
@@ -944,10 +1018,6 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
                 streamer._giveback(f"board: {msg}\n")
             streamer.finish(done=True, exit_code=rc)
             return rc
-        state["proc"] = proc
-        for signum in state.pop("pending"):
-            forward(signum)
-        state["pending"] = []
         stop_reading = threading.Event()
         reader = threading.Thread(target=pump, args=(proc.stdout.fileno(), streamer, stop_reading.is_set),
                                   daemon=True)
@@ -965,7 +1035,8 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
                     except OSError:
                         pass
                     state["kill_at"], killed = float("inf"), True
-        state["exited"] = True
+        with lock:
+            state["exited"] = True
         if sigs.got:  # stopped: also end what it left running in its group
             end_group(proc.pid)
         reader.join(DRAIN_AFTER_EXIT)
@@ -1138,7 +1209,11 @@ def wait_for_reply(be, post_id: str, timeout: float | None, as_json: bool, post:
         while True:
             if post is None:
                 try:
-                    post = be.get_post(post_id, patience=0)
+                    if remote:  # a server that never answers must not hold a poll (or --timeout)
+                        left = READ_PATIENCE if deadline is None else deadline - time.monotonic()
+                        post = be.get_post(post_id, patience=0, read_timeout=min(READ_PATIENCE, left))
+                    else:
+                        post = be.get_post(post_id, patience=0)
                     failing_since = None
                 except Exception as e:
                     if not is_transient(e):
@@ -1487,20 +1562,30 @@ def warn_hint() -> None:
         pass
 
 
+def _swallow_signal(_signum, _frame) -> None:
+    pass
+
+
 def main() -> None:
     global KEEP_SIGNAL_HANDLERS
     KEEP_SIGNAL_HANDLERS = True
     code = run(sys.argv[1:])
-    try:
-        sys.stdout.flush()
-    except (BrokenPipeError, OSError, ValueError, AttributeError):
-        # Don't let a closed stdout turn into a traceback at interpreter shutdown.
+    # From here on no signal may change the exit status: swallow the stop signals, flush,
+    # and leave with os._exit, skipping the interpreter's shutdown (which restores the
+    # default actions, so a late signal of a storm could kill board there). A no-op
+    # handler rather than SIG_IGN: CPython reports a signal that arrived for the old
+    # handler but finds SIG_IGN installed as "ignored due to race condition" on stderr.
+    for sig in STOP_SIGNALS:
         try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, 1)
-        except OSError:
+            signal.signal(sig, _swallow_signal)
+        except (ValueError, OSError):
             pass
-    sys.exit(code)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError, AttributeError):
+            pass  # a closed stdout never fails a command
+    os._exit(code if isinstance(code, int) and 0 <= code <= 255 else 1)
 
 
 if __name__ == "__main__":

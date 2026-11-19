@@ -339,8 +339,10 @@ def test_P2_3_git_env_in_child_and_help(board, store):
     r = board("log", "-a", "x", "--", "sh", "-c", 'echo "E=$GIT_EDITOR P=$GIT_TERMINAL_PROMPT"')
     pid = r.stdout.strip()
     assert "E=true P=0" in store.get_post(pid)["payload"]["text"]
-    r = board("log", "-a", "x", "--", "sh", "-c", 'echo "E=$GIT_EDITOR"', env={"GIT_EDITOR": "vim"})
-    assert "E=vim" in store.get_post(r.stdout.strip())["payload"]["text"]
+    # forced even when exported (round 3 N3): CMD never has a terminal for vim
+    r = board("log", "-a", "x", "--", "sh", "-c", 'echo "E=$GIT_EDITOR S=$GIT_SEQUENCE_EDITOR V=$EDITOR"',
+              env={"GIT_EDITOR": "vim", "GIT_SEQUENCE_EDITOR": "vim", "EDITOR": "nano"})
+    assert "E=true S=true V=nano" in store.get_post(r.stdout.strip())["payload"]["text"]
     from board.help import HELP
     assert "no" in HELP and "GIT_EDITOR=true" in HELP
 
