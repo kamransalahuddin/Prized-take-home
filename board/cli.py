@@ -54,10 +54,11 @@ HINT = "Run 'board help' for usage."
 # SAME request_id for this long: a slow request may still commit, and the retry then returns
 # the stored result instead of writing twice.
 WRITE_PATIENCE = env_seconds("BOARD_WRITE_PATIENCE", 20)
-MIN_ATTEMPTS = 4  # ... and at least this many tries (unless that takes 3x the patience)
+MIN_ATTEMPTS = 2  # ... and at least this many tries
+MIN_ATTEMPT_TIMEOUT = 4.0  # each try may take what is left of the patience, but at least this
 READ_PATIENCE = 5.0  # `board ls` over HTTP: a read can just be run again
 CONNECT_TIMEOUT = 3.0  # HTTP: no connection within this -> the server is not reachable
-READ_TIMEOUT = 30.0  # ... but a slow answer is waited for (the write may be committing)
+READ_TIMEOUT = 30.0  # no request ever takes longer than this in total (headers and body)
 CREATE_WAIT = 3.0  # `board log` starts the command after this even if the post isn't created yet
 INTERRUPT_PATIENCE = 10.0  # posting the rest of the output after a SIGINT/SIGTERM/SIGHUP
 KILL_GRACE = 5.0  # after forwarding a stop signal, SIGKILL the child's group if still running
@@ -114,6 +115,16 @@ class MaybeApplied(Transient):
                          f"applied (request id {request_id}); check with board ls before repeating it")
         self.request_id = request_id
         self.short = f"BOARD_URL {url} did not answer ({cause})"
+
+
+class Abandoned(Unreachable):
+    """Out of time (patience, stop-signal budget, a second signal) before sending: nothing
+    was applied."""
+
+
+class GaveUp(Exception):
+    """A request that was sent got no complete answer in time (internal to HttpBackend)."""
+
 
 
 def is_transient(e: BaseException) -> bool:
@@ -224,59 +235,117 @@ class HttpBackend:
         self.url = url.rstrip("/")
         self.client = httpx.Client(base_url=self.url,
                                    timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT))
+        # Optional: seconds this backend may still spend on requests (0 = abandon now),
+        # re-checked while a request is in flight. Set by a Streamer (finish patience,
+        # stop-signal budget, a second signal).
+        self.budget: Callable[[], float] | None = None
 
     def _unreachable(self, e: BaseException) -> Unreachable:
         return Unreachable(f"cannot reach BOARD_URL {self.url}: {e or type(e).__name__}. "
                            "Start board serve there, or unset BOARD_URL to save posts locally.")
 
-    def _req(self, method: str, path: str, request_id: str | None = None, **kw) -> Any:
+    def _left(self) -> float:
+        return float("inf") if self.budget is None else self.budget()
+
+    def _exchange(self, method: str, path: str, limit: float, **kw) -> tuple[Any, bytes]:
+        """Send one request and read the whole answer within `limit` seconds IN TOTAL (and
+        within the budget). httpx's read timeout restarts on every byte, so a server that
+        trickles its answer could hold it forever: the request runs in a daemon thread
+        that streams the body and stops at the next chunk once abandoned; this thread
+        gives up at the deadline (or when the budget runs out) without waiting for it.
+        Raises httpx's errors, or GaveUp."""
         httpx = self.httpx
+        t = max(0.05, min(READ_TIMEOUT, limit))
+        timeout = httpx.Timeout(t, connect=min(CONNECT_TIMEOUT, t))
+        box: dict[str, Any] = {}
+        done, cancel = threading.Event(), threading.Event()
+
+        def work() -> None:
+            try:
+                with self.client.stream(method, path, timeout=timeout, **kw) as r:
+                    body = bytearray()
+                    for chunk in r.iter_bytes():
+                        if cancel.is_set():
+                            return
+                        body += chunk
+                    box["r"] = (r, bytes(body))
+            except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+                box["e"] = e
+            finally:
+                done.set()
+
+        begin = time.monotonic()
+        end = begin + limit
+        threading.Thread(target=work, daemon=True).start()
+        while not done.wait(max(0.0, min(0.1, end - time.monotonic()))):
+            if time.monotonic() >= end:
+                cancel.set()
+                raise GaveUp(f"no answer within {limit:.3g}s")
+            if self._left() <= 0:
+                cancel.set()
+                raise GaveUp(f"no answer within {time.monotonic() - begin:.0f}s")
+        if "e" in box:
+            raise box["e"]
+        return box["r"]
+
+    def _req(self, method: str, path: str, request_id: str | None = None, limit: float = READ_TIMEOUT,
+             **kw) -> Any:
+        httpx = self.httpx
+        limit = min(limit, self._left())
+        if limit <= 0:  # out of time before sending: nothing was applied
+            raise Abandoned(f"gave up on BOARD_URL {self.url} (out of time)")
         try:
-            r = self.client.request(method, path, **kw)
+            r, body = self._exchange(method, path, limit, **kw)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.UnsupportedProtocol) as e:
             raise self._unreachable(e) from e  # never sent: nothing was applied
-        except httpx.TransportError as e:
+        except (httpx.TransportError, GaveUp) as e:
             if method == "POST":  # sent (at least partly), no answer: may have been applied
                 raise MaybeApplied(self.url, str(e) or type(e).__name__, request_id) from e
             raise Unreachable(f"BOARD_URL {self.url} did not answer: {e or type(e).__name__}") from e
         if r.status_code >= 400:
+            text = body.decode("utf-8", "replace")
             try:
-                msg = r.json().get("error") or r.text
-            except (ValueError, AttributeError):
-                msg = r.text.strip()[:200] or r.reason_phrase
+                data = json.loads(text)
+                msg = (data.get("error") if isinstance(data, dict) else None) or text
+            except ValueError:
+                msg = text.strip()[:200] or r.reason_phrase
             if r.status_code >= 500 or r.status_code in (408, 429):
                 raise ServerError(f"{msg} (HTTP {r.status_code})", r.status_code,
                                   request_id if method == "POST" else None)
             raise BoardError(f"{msg} (HTTP {r.status_code})", r.status_code)
         try:
-            return r.json()
+            return json.loads(body)
         except ValueError as e:
             raise BoardError(f"BOARD_URL {self.url} did not answer like a board server", 502) from e
 
-    def _read_timeout(self, seconds: float) -> Any:
-        """Timeouts for a read that must give up within about `seconds` (ls, wait's polls):
-        a server that accepts the connection but never answers must not hold it for the
-        full READ_TIMEOUT."""
-        return self.httpx.Timeout(min(READ_TIMEOUT, max(0.5, seconds)), connect=CONNECT_TIMEOUT)
-
-    def _retrying(self, patience: float | None, fn: Callable[[], Any], request_id: str | None = None,
+    def _retrying(self, patience: float | None, fn: Callable[[float], Any], request_id: str | None = None,
                   min_attempts: int = MIN_ATTEMPTS) -> Any:
-        """Call fn, retrying transient failures (with backoff) until `patience` seconds have
-        passed (and, with patience > 0, at least MIN_ATTEMPTS tries: a request that timed out
-        may still have committed, so slow attempts must not use up all the tries); then
-        re-raise the last one. Writes keep their request_id on every retry. If any attempt
-        of a write reached the server, the final error says it may have been applied."""
+        """Call fn(limit), retrying transient failures (with backoff) until `patience`
+        seconds have passed and at least `min_attempts` tries were made; then re-raise the
+        last one. `limit` is the total time one attempt may take: what is left of the
+        patience, but at least MIN_ATTEMPT_TIMEOUT (a slow request may still commit, and
+        its retry then returns the stored result), and the first attempt leaves that much
+        for a second one, so a server that never answers costs about `patience` s in all.
+        Writes keep their request_id on every retry. If any attempt of a write reached the
+        server, the final error says it may have been applied."""
         patience = WRITE_PATIENCE if patience is None else patience
         start, delay, attempts, reached = time.monotonic(), 0.25, 0, None
         while True:
+            left = patience - (time.monotonic() - start)
+            if patience <= 0:
+                limit = READ_TIMEOUT
+            else:
+                spare = MIN_ATTEMPT_TIMEOUT if attempts < min_attempts - 1 else 0.0
+                limit = min(READ_TIMEOUT, max(MIN_ATTEMPT_TIMEOUT, left - spare))
             try:
                 attempts += 1
-                return fn()
+                return fn(limit)
             except Transient as e:
                 if isinstance(e, MaybeApplied):
                     reached = e
                 elapsed = time.monotonic() - start
-                if elapsed >= patience and (patience <= 0 or attempts >= min_attempts or elapsed >= 3 * patience):
+                if (elapsed >= patience and (patience <= 0 or attempts >= min_attempts)) \
+                        or self._left() <= delay:
                     if reached is not None and isinstance(e, Unreachable):
                         raise reached from e  # down now, but an earlier try got through
                     raise
@@ -288,7 +357,7 @@ class HttpBackend:
         if body is not None:
             kw["json"] = body
             request_id = request_id or body.get("request_id")
-        return self._retrying(patience, lambda: self._req("POST", path, request_id, **kw), request_id)
+        return self._retrying(patience, lambda limit: self._req("POST", path, request_id, limit, **kw), request_id)
 
     def create_post(self, patience: float | None = None, **kw) -> tuple[dict, bool]:
         body = {k: v for k, v in kw.items() if v is not None}
@@ -314,18 +383,19 @@ class HttpBackend:
                            headers={"X-Request-Id": rid}, request_id=rid)
 
     def get_post(self, post_id: str, patience: float | None = None, read_timeout: float | None = None) -> dict:
-        kw = {} if read_timeout is None else {"timeout": self._read_timeout(read_timeout)}
-        return self._retrying(patience, lambda: self._req("GET", f"/api/posts/{post_id}", **kw))
+        return self._retrying(patience, lambda limit: self._req(
+            "GET", f"/api/posts/{post_id}", limit=limit if read_timeout is None else read_timeout))
 
     def list_posts(self, agent: str | None, limit: int) -> list[dict]:
         params: dict = {"limit": limit}
         if agent:
             params["agent"] = agent
         # A read can simply be run again: give up READ_PATIENCE s after the start, however
-        # the time went (refused connections retried, or one request nobody answers).
+        # the time went (refused connections retried, one request nobody answers, or an
+        # answer trickled in byte by byte).
         deadline = time.monotonic() + READ_PATIENCE
-        return self._retrying(READ_PATIENCE, lambda: self._req(
-            "GET", "/api/posts", params=params, timeout=self._read_timeout(deadline - time.monotonic())),
+        return self._retrying(READ_PATIENCE, lambda _limit: self._req(
+            "GET", "/api/posts", params=params, limit=max(0.1, deadline - time.monotonic())),
             min_attempts=1)["posts"]
 
     def maybe_reap(self) -> None:
@@ -505,7 +575,9 @@ class Streamer:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.stopping = threading.Event()
-        self.abort = threading.Event()  # stop retrying in finish() (a signal arrived)
+        self.abort = threading.Event()  # stop posting now, even mid-request (a second signal)
+        self.stop_deadline: float | None = None  # a stop signal arrived: post until then
+        self.finish_deadline: float | None = None
         self.created = threading.Event()
         self.dead = (be is None and opener is None) or (post_id is None and create is None)
         if post_id is not None or self.dead:
@@ -514,11 +586,30 @@ class Streamer:
         self.last_error: BaseException | None = None
         self.warned = False
         self.dropped = False
+        self.gave_up = False  # finish() could not post everything (warned)
         self.inflight: tuple[str, str, dict] | None = None  # (request_id, text, kw) awaiting success
         self.thread = threading.Thread(target=self._run, daemon=True)
+        self._attach(be)
 
     def start(self) -> None:
         self.thread.start()
+
+    def budget(self) -> float:
+        """Seconds posting may still take (0: stop now, abandoning a request in flight)."""
+        if self.abort.is_set():
+            return 0.0
+        ends = [d for d in (self.stop_deadline, self.finish_deadline) if d is not None]
+        return min(ends) - time.monotonic() if ends else float("inf")
+
+    def interrupt(self, seconds: float = INTERRUPT_PATIENCE) -> None:
+        """A stop signal: whatever happens next, posting ends within `seconds`."""
+        end = time.monotonic() + seconds
+        if self.stop_deadline is None or end < self.stop_deadline:
+            self.stop_deadline = end
+
+    def _attach(self, be) -> None:
+        if isinstance(be, HttpBackend):  # every request then honours budget()
+            be.budget = self.budget
 
     def feed(self, data: bytes) -> None:
         if self.echo:
@@ -568,11 +659,14 @@ class Streamer:
                 self.dropped = True
 
     def unposted(self) -> int:
+        """Bytes of output not (yet) posted."""
         with self.lock:
-            return len(self.pending) + (len(self.inflight[1]) if self.inflight else 0)
+            text = self.pending + (self.inflight[1] if self.inflight else "")
+        return len(text.encode("utf-8", "replace"))
 
     def _retry_later(self, e: BaseException) -> bool:
-        self.last_error = e
+        if not (isinstance(e, Abandoned) and self.last_error is not None):  # keep the real cause
+            self.last_error = e
         if not self.warned:
             warn(f"could not post output to the board (will retry): {getattr(e, 'short', None) or err_text(e)}")
             self.warned = True
@@ -638,6 +732,7 @@ class Streamer:
     def _open(self) -> bool:
         try:
             self.be = self.opener(self)
+            self._attach(self.be)
             return True
         except Exception as e:
             self.dead, self.error, self.open_error = True, e, e
@@ -658,25 +753,45 @@ class Streamer:
             ok = self._step()
             backoff = FLUSH_INTERVAL if ok else min(max(backoff, FLUSH_INTERVAL) * 2, 5.0)
 
-    def finish(self, patience: float = FINISH_PATIENCE, **final_kw) -> None:
-        """Stop the flusher and send the rest together with the final status change,
-        retrying transient failures for up to `patience` s (or until `abort` is set)."""
+    def stop_flusher(self) -> bool:
+        """Stop the flusher thread; False if it is still busy when the budget runs out (it
+        is then abandoned: a request it has in flight is given up within 0.1 s)."""
         self.stopping.set()
         self.wake.set()
-        self.thread.join()
+        while self.thread.is_alive() and self.budget() > 0:
+            self.thread.join(0.1)
+        self.thread.join(1.0)
+        return not self.thread.is_alive()
+
+    def finish(self, patience: float = FINISH_PATIENCE, final: Callable[[], dict] | None = None,
+               **final_kw) -> None:
+        """Stop the flusher and send the rest together with the final status change
+        (`final_kw`, or what `final()` returns once the flusher stopped), retrying
+        transient failures for up to `patience` s in all, never past a stop signal's
+        budget, and not at all once `abort` is set (a request in flight is abandoned)."""
+        self.finish_deadline = time.monotonic() + patience
+        if not self.stop_flusher():
+            where = f" to {self.post_id}" if self.post_id else " (the log post was not created)"
+            warn(f"giving up: {self.unposted()} bytes of output not posted{where}")
+            self.error = self.error or self.last_error
+            self.gave_up = True
+            return
         if self.dead:
             return
-        deadline, delay = time.monotonic() + patience, 0.25
+        if final is not None:
+            final_kw = {**final(), **final_kw}
+        delay = 0.25
         told = False
         what = "board unreachable" if isinstance(self.be, HttpBackend) else "board database busy"
 
         def until(fn: Callable[[], bool]) -> bool:
             nonlocal delay, told
             while not fn():
-                if self.abort.is_set() or time.monotonic() + delay > deadline:
+                left = self.budget()
+                if self.abort.is_set() or left <= delay:
                     return False
                 if not told:
-                    warn(f"{what}; retrying for up to {int(patience)}s to post the end of the output")
+                    warn(f"{what}; retrying for up to {max(1, int(left))}s to post the end of the output")
                     told = True
                 self.abort.wait(delay)
                 delay = min(delay * 2, 5.0)
@@ -687,7 +802,9 @@ class Streamer:
                 self.error = self.error or self.last_error
                 left = len(self._take(final=True).encode("utf-8", "replace"))
                 warn(f"could not create the log post on the board; {left} bytes of output were not posted"
-                     + (f" ({err_text(self.last_error)})" if self.last_error else ""))
+                     + (f" ({getattr(self.last_error, 'short', None) or err_text(self.last_error)})"
+                        if self.last_error else ""))
+                self.gave_up = True
                 return
             if self.dead:
                 return
@@ -707,6 +824,7 @@ class Streamer:
             if not until(lambda: self._send(rid, chunk, **kw)):
                 left = sum(len(c[1].encode("utf-8", "replace")) for c in chunks[n:])
                 warn(f"giving up: {left} bytes of output not posted to {self.post_id}")
+                self.gave_up = True
                 return
             if self.dead:
                 return
@@ -825,19 +943,40 @@ class StopSignals:
                 pass
 
 
-def stream_input(fd: int, streamer: Streamer) -> int | None:
-    """Pipe mode / append -: pump fd into the streamer. On a stop signal keep draining for
-    up to 1 s, then stop. Returns the first signal received, or None."""
+def stream_input(fd: int, streamer: Streamer, wait_created: float = 0.0) -> int | None:
+    """Pipe mode / append -: pump fd into the streamer (first waiting up to `wait_created`
+    s for the post to exist, so its ID is printed first). On a stop signal keep draining
+    for up to 1 s, then stop (posting gets INTERRUPT_PATIENCE s from the signal; a second
+    signal stops it). Returns the first signal received, or None."""
     stop_at: list[float] = []
 
     def on_signal(signum: int) -> None:
         if not stop_at:
             stop_at.append(time.monotonic() + DRAIN_AFTER_EXIT)
-        elif streamer.stopping.is_set():
+            streamer.interrupt()  # drain + post what was read: INTERRUPT_PATIENCE s in all
+        else:
+            streamer.abort.set()  # a second signal: stop posting at once
+
+    with StopSignals(on_signal) as sigs:
+        end = time.monotonic() + wait_created
+        while not stop_at and time.monotonic() < end and not streamer.created.wait(0.05):
+            pass
+        pump(fd, streamer, lambda: bool(stop_at) and time.monotonic() > stop_at[0])
+        return sigs.got[0] if sigs.got else None
+
+
+def finish_on_signals(streamer: Streamer, **kw) -> int | None:
+    """streamer.finish(**kw) with stop signals handled: the first one limits posting to
+    INTERRUPT_PATIENCE s from then (if no signal did yet), the next one stops it at once.
+    Returns the first signal received, or None."""
+    def on_signal(_signum: int) -> None:
+        if streamer.stop_deadline is None:
+            streamer.interrupt()
+        else:
             streamer.abort.set()
 
     with StopSignals(on_signal) as sigs:
-        pump(fd, streamer, lambda: bool(stop_at) and time.monotonic() > stop_at[0])
+        streamer.finish(**kw)
         return sigs.got[0] if sigs.got else None
 
 
@@ -981,9 +1120,11 @@ def run_child(cmd: List[str], streamer: Streamer) -> int:
 
     def on_signal(signum: int) -> None:
         with lock:
-            if state["exited"]:  # child gone: don't touch background leftovers; stop retrying
+            if state["exited"]:  # child gone: don't touch background leftovers; stop posting
                 streamer.abort.set()
-            elif state["proc"] is None:
+                return
+            streamer.interrupt()  # the rest is posted within INTERRUPT_PATIENCE s of the first signal
+            if state["proc"] is None:
                 state["pending"].append(signum)  # replayed right after spawn
             else:
                 forward(signum)
@@ -1092,18 +1233,19 @@ def log_cmd(
     streamer.start()
 
     if not cmd:  # pipe mode
-        streamer.created.wait(CREATE_WAIT)
-        got = stream_input(sys.stdin.fileno(), streamer)
+        got = stream_input(sys.stdin.fileno(), streamer, wait_created=CREATE_WAIT)
         if got is not None:
-            with StopSignals(lambda _s: streamer.abort.set()):
-                streamer.finish(patience=INTERRUPT_PATIENCE, done=True, status="error")
+            finish_on_signals(streamer, patience=INTERRUPT_PATIENCE, done=True, status="error")
             raise typer.Exit(128 + got)
-        with StopSignals(lambda _s: streamer.abort.set()):
-            streamer.finish(done=True)
+        got = finish_on_signals(streamer, done=True)
+        if got is not None:  # stopped while posting the end of the output
+            raise typer.Exit(128 + got)
         if streamer.post_id is None and streamer.error is not None:
             raise streamer.error
         if streamer.dead:  # posting stopped (warned): exit 1, like append -
             raise typer.Exit(1)
+        if streamer.gave_up:  # the end of the output could not be posted (warned)
+            raise typer.Exit(3 if isinstance(streamer.last_error, Unreachable) else 1)
         return
 
     rc = run_child(cmd, streamer)
@@ -1143,6 +1285,7 @@ def append_stream(post_id: str, s: str | None, title: str | None, as_json: bool,
     drain/echo; they make the exit code 1 (3 if BOARD_URL is unreachable) at the end."""
     def opener(st: Streamer):  # in the flusher thread: stdin is drained meanwhile
         be = backend()
+        st._attach(be)  # (a stop signal bounds this read too)
         post = be.get_post(post_id)
         if post["kind"] not in ("log", "text", "markdown"):
             raise BoardError("can only append to log, text or markdown posts; use board post -k KEY to replace it", 409)
@@ -1154,21 +1297,25 @@ def append_stream(post_id: str, s: str | None, title: str | None, as_json: bool,
                         open_failed=lambda e: f"{err_text(e)}; passing output through without posting")
     streamer.start()
     got = stream_input(sys.stdin.fileno(), streamer)
-    with StopSignals(lambda _s: streamer.abort.set()):
-        streamer.stopping.set()  # (the post's kind is known once the opener finished)
-        streamer.wake.set()
-        streamer.thread.join()
-        final = {k: v for k, v in (("status", s), ("title", title)) if v is not None}
+
+    def final() -> dict:  # the post's kind is known once the opener finished
         if got is not None and streamer.expect_kind == "log":
-            final = {"done": True, "status": "error"}
-        streamer.finish(patience=INTERRUPT_PATIENCE if got is not None else FINISH_PATIENCE, **final)
+            return {"done": True, "status": "error"}
+        return {k: v for k, v in (("status", s), ("title", title)) if v is not None}
+
+    late = finish_on_signals(streamer, patience=INTERRUPT_PATIENCE if got is not None else FINISH_PATIENCE,
+                             final=final)
+    got = got if got is not None else late
     if got is not None:
         raise typer.Exit(128 + got)
     if streamer.open_error is not None:
         raise streamer.open_error
     if streamer.dead:
         raise typer.Exit(1)
+    if streamer.gave_up:  # (warned with the bytes not posted)
+        raise typer.Exit(3 if isinstance(streamer.last_error, Unreachable) else 1)
     be = streamer.be
+    be.budget = None  # (the streamer's deadlines are over)
     res = be.get_post(post_id)
     res.pop("payload", None)
     emit(res, as_json, quiet)
@@ -1211,7 +1358,7 @@ def wait_for_reply(be, post_id: str, timeout: float | None, as_json: bool, post:
                 try:
                     if remote:  # a server that never answers must not hold a poll (or --timeout)
                         left = READ_PATIENCE if deadline is None else deadline - time.monotonic()
-                        post = be.get_post(post_id, patience=0, read_timeout=min(READ_PATIENCE, left))
+                        post = be.get_post(post_id, patience=0, read_timeout=max(0.1, min(READ_PATIENCE, left)))
                     else:
                         post = be.get_post(post_id, patience=0)
                     failing_since = None
