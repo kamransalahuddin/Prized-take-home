@@ -29,6 +29,9 @@ AGENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$")
 LOG_CAP = 2 * 1024 * 1024  # keep the last 2 MB of each log
 MAX_ASSET = 20 * 1024 * 1024
 MAX_TABLE_ROWS = 50_000
+MAX_REPLY = 10_000
+REPLY_ACTIONS = ("approve", "reject", "answer")
+REQUEST_TTL = 24 * 3600  # idempotency records older than this are pruned
 _B32 = "abcdefghijklmnopqrstuvwxyz234567"
 
 SCHEMA = """
@@ -68,6 +71,12 @@ CREATE TABLE IF NOT EXISTS events (
   data       TEXT NOT NULL,          -- JSON event payload (see docs/contract.md)
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requests (   -- idempotency: request_id -> stored result
+  id         TEXT PRIMARY KEY,
+  result     TEXT NOT NULL,          -- JSON {"op": ..., "result": ...}
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at);
 """
 
 
@@ -83,6 +92,19 @@ class BoardError(Exception):
 def now_iso() -> str:
     d = datetime.now(timezone.utc)
     return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"
+
+
+def iso_at(ts: float) -> str:
+    d = datetime.fromtimestamp(ts, timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"
+
+
+def check_request_id(request_id: Any) -> str | None:
+    if request_id is None or request_id == "":
+        return None
+    if not isinstance(request_id, str) or len(request_id) > 200:
+        raise BoardError("request_id must be a string of at most 200 characters")
+    return request_id
 
 
 def new_id(prefix: str, n: int) -> str:
@@ -182,6 +204,13 @@ def normalize_table(value: Any) -> dict:
 
 
 def normalize_payload(kind: str, payload: Any) -> dict:
+    out = _normalize_payload(kind, payload)
+    if payload.get("ask") is True and kind != "log":
+        out["ask"] = True  # created by `board ask`: the page offers reply buttons
+    return out
+
+
+def _normalize_payload(kind: str, payload: Any) -> dict:
     if kind not in KINDS:
         raise BoardError(f"bad kind {kind!r}: use one of {', '.join(KINDS)}", 415)
     if not isinstance(payload, dict):
@@ -348,6 +377,34 @@ class Store:
         c.execute("UPDATE posts SET seq=? WHERE id=?", (seq, post_id))
         return seq
 
+    def _stored(self, c: sqlite3.Connection, op: str, request_id: str | None) -> Any:
+        """The stored result of an earlier write with this request_id, or None."""
+        if request_id is None:
+            return None
+        row = c.execute("SELECT result FROM requests WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            return None
+        stored = json.loads(row[0])
+        if stored.get("op") != op:
+            raise BoardError("request_id was already used for a different kind of request", 409)
+        return stored
+
+    def _idem(self, c: sqlite3.Connection, op: str, request_id: str | None, fn) -> Any:
+        """Run `fn(c)` once per request_id (inside the caller's transaction). A retry of a
+        write that already committed (response lost) returns the stored result instead of
+        writing again."""
+        stored = self._stored(c, op, request_id)
+        if stored is not None:
+            return stored["result"]
+        out = fn(c)
+        if request_id is not None:
+            c.execute(
+                "INSERT INTO requests(id, result, created_at) VALUES (?,?,?)",
+                (request_id, json.dumps({"op": op, "result": out}, ensure_ascii=False), now_iso()),
+            )
+            c.execute("DELETE FROM requests WHERE created_at < ?", (iso_at(time.time() - REQUEST_TTL),))
+        return out
+
     def create_post(
         self,
         agent: str,
@@ -357,10 +414,13 @@ class Store:
         status: str | None = None,
         key: str | None = None,
         live: bool = False,
+        request_id: str | None = None,
     ) -> tuple[dict, bool]:
         """Create a post, or with `key` replace this agent's existing post with that key
         (same id and created_at; kind/title/status/payload replaced; log chunks cleared).
-        Returns (post, created)."""
+        Returns (post, created). With `request_id`, a repeat of the same request returns
+        the first result without writing."""
+        request_id = check_request_id(request_id)
         agent = normalize_agent(agent)
         status = normalize_status(status)
         payload = normalize_payload(kind, payload)
@@ -391,9 +451,10 @@ class Store:
                 )
             post = self.get_post(pid, c)
             post["seq"] = self._event(c, "post", pid, dict(post))
-            return post, created
+            return [post, created]
 
-        return self._tx(tx)
+        post, created = self._tx(lambda c: self._idem(c, "create_post", request_id, tx))
+        return post, created
 
     def append(
         self,
@@ -405,6 +466,7 @@ class Store:
         exit_code: int | None = None,
         newline: bool = False,
         expect_kind: str | None = None,
+        request_id: str | None = None,
     ) -> dict:
         """Append text to a log/text/markdown post and/or change status/title/live.
 
@@ -412,7 +474,10 @@ class Store:
         text: joined with \\n. markdown: joined with \\n\\n.
         exit_code set → payload.exit_code, status ok/error unless status given; done → live false.
         Emits an 'append' event when text was added, else a 'post' event (full post).
-        Returns a light result {id, seq, status, title, live, updated_at, size}."""
+        Returns a light result {id, seq, status, title, live, updated_at, size}.
+        With `request_id`, a repeat of the same request returns the first result without
+        writing (so a retried log chunk is stored exactly once)."""
+        request_id = check_request_id(request_id)
         if text == "":
             text = None
         if text is None and status is None and title is None and not done and exit_code is None:
@@ -492,7 +557,45 @@ class Store:
             return {"id": post_id, "seq": seq, "status": new_status, "title": new_title, "live": bool(live),
                     "updated_at": ts, "size": size}
 
-        return self._tx(tx)
+        return self._tx(lambda c: self._idem(c, "append", request_id, tx))
+
+    def reply(self, post_id: str, action: str, text: str | None = None, request_id: str | None = None) -> dict:
+        """The human's answer to a blocked post: approve / reject (optional note) or answer
+        (text required). Sets payload.reply = {action, text, at}, status blocked -> info,
+        emits a 'post' event. Only once per post, and only while it is blocked (409).
+        Returns the full post."""
+        request_id = check_request_id(request_id)
+        if not isinstance(action, str) or action not in REPLY_ACTIONS:
+            raise BoardError("action must be approve, reject or answer")
+        if text is not None and not isinstance(text, str):
+            raise BoardError("text must be a string")
+        if text is not None and not text.strip():
+            text = None
+        if action == "answer" and text is None:
+            raise BoardError("answer needs text")
+        if text is not None and len(text) > MAX_REPLY:
+            raise BoardError(f"reply text is longer than {MAX_REPLY} characters")
+
+        def tx(c: sqlite3.Connection):
+            r = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+            if not r:
+                raise BoardError(f"no post {post_id}", 404)
+            payload = json.loads(r["payload"])
+            if payload.get("reply"):
+                raise BoardError("already answered", 409)
+            if r["status"] != "blocked":
+                raise BoardError("post is not waiting for input", 409)
+            ts = now_iso()
+            payload["reply"] = {"action": action, "text": text, "at": ts}
+            c.execute(
+                "UPDATE posts SET payload=?, status='info', updated_at=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), ts, post_id),
+            )
+            post = self.get_post(post_id, c)
+            post["seq"] = self._event(c, "post", post_id, dict(post))
+            return post
+
+        return self._tx(lambda c: self._idem(c, "reply", request_id, tx))
 
     def reap_dead_logs(self) -> int:
         """Close live logs whose `board log` process (on this host) no longer exists.
@@ -522,7 +625,11 @@ class Store:
 
     # -- assets
 
-    def add_asset(self, data: bytes) -> dict:
+    def add_asset(self, data: bytes, request_id: str | None = None) -> dict:
+        request_id = check_request_id(request_id)
+        stored = self._stored(self.conn, "add_asset", request_id)
+        if stored is not None:
+            return stored["result"]
         if len(data) > MAX_ASSET:
             raise BoardError("image is larger than 20 MB", 413)
         mime = sniff_image(data)
@@ -535,13 +642,21 @@ class Store:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.assets_dir / filename)
-        self._tx(
-            lambda c: c.execute(
+
+        def tx(c: sqlite3.Connection):
+            c.execute(
                 "INSERT INTO assets(id, filename, mime, size, created_at) VALUES (?,?,?,?,?)",
                 (aid, filename, mime, len(data), now_iso()),
             )
-        )
-        return {"id": aid, "mime": mime, "size": len(data), "url": f"/api/assets/{aid}"}
+            return {"id": aid, "mime": mime, "size": len(data), "url": f"/api/assets/{aid}"}
+
+        info = self._tx(lambda c: self._idem(c, "add_asset", request_id, tx))
+        if info["id"] != aid:  # a concurrent duplicate of this request won the race
+            try:
+                (self.assets_dir / filename).unlink()
+            except OSError:
+                pass
+        return info
 
     def get_asset(self, asset_id: str) -> tuple[Path, str]:
         r = self.conn.execute("SELECT filename, mime FROM assets WHERE id=?", (asset_id,)).fetchone()

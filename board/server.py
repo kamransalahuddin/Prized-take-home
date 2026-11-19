@@ -313,6 +313,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             status=opt_str(d, "status"),
             key=opt_str(d, "key"),
             live=bool(d.get("live", False)),
+            request_id=opt_str(d, "request_id"),
         )
         hub.nudge.set()
         return JSONResponse({**post, "created": created}, status_code=201 if created else 200)
@@ -333,9 +334,22 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             exit_code=exit_code,
             newline=bool(d.get("newline", False)),
             expect_kind=opt_str(d, "expect_kind"),
+            request_id=opt_str(d, "request_id"),
         )
         hub.nudge.set()
         return res
+
+    @app.post("/api/posts/{post_id}/reply")
+    async def reply(post_id: str, request: Request):
+        d = await read_json(request)
+        action = d.get("action")
+        if not isinstance(action, str) or action not in ("approve", "reject", "answer"):
+            raise BoardError("action must be approve, reject or answer")
+        post = await writer.call(
+            "reply", post_id, action, text=opt_str(d, "text"), request_id=opt_str(d, "request_id")
+        )
+        hub.nudge.set()
+        return post
 
     @app.post("/api/assets")
     async def upload_asset(request: Request):
@@ -349,9 +363,11 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         f = form.get("file")
         if f is None or isinstance(f, str):
             raise BoardError("multipart field 'file' is required")
+        rid = form.get("request_id")
+        rid = rid if isinstance(rid, str) and rid else request.headers.get("x-request-id")
         data = await f.read()
         await form.close()
-        info = await writer.call("add_asset", data)
+        info = await writer.call("add_asset", data, request_id=rid or None)
         return JSONResponse(info, status_code=201)
 
     @app.get("/api/posts")

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
 
@@ -30,6 +31,14 @@ FINISH_PATIENCE = float(os.environ.get("BOARD_FINISH_PATIENCE", 60))  # retry fi
 FLUSH_BYTES = 256 * 1024
 MAX_PENDING = 10 * 1024 * 1024
 HINT = "Run 'board help' for usage."
+HTTP_WRITE_ATTEMPTS = 3  # one-shot HTTP writes retry transport errors (same request_id)
+WAIT_POLL_LOCAL = 0.5
+WAIT_POLL_HTTP = 1.0
+EXIT_TIMEOUT = 4
+
+
+def new_request_id() -> str:
+    return uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------- errors
@@ -64,8 +73,11 @@ class LocalBackend:
     def append(self, post_id: str, **kw) -> dict:
         return self.store.append(post_id, **kw)
 
-    def add_asset(self, data: bytes) -> dict:
-        return self.store.add_asset(data)
+    def add_asset(self, data: bytes, request_id: str | None = None) -> dict:
+        return self.store.add_asset(data, request_id=request_id)
+
+    def reply(self, post_id: str, action: str, text: str | None = None, request_id: str | None = None) -> dict:
+        return self.store.reply(post_id, action, text, request_id=request_id)
 
     def get_post(self, post_id: str) -> dict:
         return self.store.get_post(post_id)
@@ -104,18 +116,44 @@ class HttpBackend:
         except ValueError as e:
             raise BoardError(f"BOARD_URL {self.url} did not answer like a board server", 502) from e
 
+    def _write(self, path: str, body: dict | None = None, **kw) -> Any:
+        """POST with a request_id, retrying transport errors with the SAME id: if the
+        server committed but the response was lost, the retry returns the stored result
+        instead of writing twice."""
+        delay = 0.25
+        for attempt in range(HTTP_WRITE_ATTEMPTS):
+            try:
+                if body is not None:
+                    return self._req("POST", path, json=body, **kw)
+                return self._req("POST", path, **kw)
+            except Unreachable:
+                if attempt == HTTP_WRITE_ATTEMPTS - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+
     def create_post(self, **kw) -> tuple[dict, bool]:
         body = {k: v for k, v in kw.items() if v is not None}
-        post = self._req("POST", "/api/posts", json=body)
+        body.setdefault("request_id", new_request_id())
+        post = self._write("/api/posts", body)
         created = post.pop("created", True)
         return post, created
 
     def append(self, post_id: str, **kw) -> dict:
         body = {k: v for k, v in kw.items() if v is not None and v is not False}
-        return self._req("POST", f"/api/posts/{post_id}/append", json=body)
+        body.setdefault("request_id", new_request_id())
+        return self._write(f"/api/posts/{post_id}/append", body)
 
-    def add_asset(self, data: bytes) -> dict:
-        return self._req("POST", "/api/assets", files={"file": ("image", data)})
+    def reply(self, post_id: str, action: str, text: str | None = None, request_id: str | None = None) -> dict:
+        body = {"action": action, "request_id": request_id or new_request_id()}
+        if text is not None:
+            body["text"] = text
+        return self._write(f"/api/posts/{post_id}/reply", body)
+
+    def add_asset(self, data: bytes, request_id: str | None = None) -> dict:
+        rid = request_id or new_request_id()
+        return self._write("/api/assets", files={"file": ("image", data)}, data={"request_id": rid},
+                           headers={"X-Request-Id": rid})
 
     def get_post(self, post_id: str) -> dict:
         return self._req("GET", f"/api/posts/{post_id}")
@@ -217,6 +255,10 @@ class Streamer:
     Storage/HTTP failures are retried with the text kept in memory (capped at 10 MB); they
     never stop the echo or the producer. A rejected post (BoardError: deleted, wrong kind)
     stops shipping but keeps echoing.
+
+    Each chunk gets its own request_id and keeps it (and its exact text) across retries:
+    if a send committed but its response was lost, the retry is recognised and stored
+    once. New output waits in `pending` and is never merged into a chunk being retried.
     """
 
     def __init__(self, be, post_id: str | None, echo: bool, expect_kind: str | None = None):
@@ -232,6 +274,7 @@ class Streamer:
         self.dead = post_id is None
         self.warned = False
         self.dropped = False
+        self.inflight: tuple[str, str] | None = None  # (request_id, text) awaiting success
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -283,19 +326,18 @@ class Streamer:
                 self.pending = self.pending[-MAX_PENDING:]
                 self.dropped = True
 
-    def _send(self, text: str, **kw) -> bool:
-        """One append; returns True on success. Transient failures give the text back."""
+    def _send(self, rid: str, text: str, **kw) -> bool:
+        """One append; returns True on success. On a transient failure the caller retries
+        the same (rid, text)."""
         try:
-            self.be.append(self.post_id, text=text or None, expect_kind=self.expect_kind, **kw)
+            self.be.append(self.post_id, text=text or None, expect_kind=self.expect_kind, request_id=rid, **kw)
             self.warned = False
             return True
         except BoardError as e:
             self.dead = True
             warn(f"stopped posting output to {self.post_id}: {e.message}")
             return True
-        except Exception as e:  # sqlite busy, HTTP down, ...: keep the text and retry
-            if text:
-                self._giveback(text)
+        except Exception as e:  # sqlite busy, HTTP down, ...: keep the chunk and retry
             if not self.warned:
                 warn(f"could not post output to the board (will retry): {e}")
                 self.warned = True
@@ -308,11 +350,17 @@ class Streamer:
             self.wake.clear()
             if self.stopping.is_set() or self.dead:
                 break
-            text = self._take(final=False)
-            if not text:
+            if self.inflight is None:
+                text = self._take(final=False)
+                if not text:
+                    backoff = FLUSH_INTERVAL
+                    continue
+                self.inflight = (new_request_id(), text)
+            if self._send(*self.inflight):
+                self.inflight = None
                 backoff = FLUSH_INTERVAL
-                continue
-            backoff = FLUSH_INTERVAL if self._send(text) else min(backoff * 2, 5.0)
+            else:
+                backoff = min(backoff * 2, 5.0)
 
     def finish(self, patience: float = FINISH_PATIENCE, **final_kw) -> None:
         """Stop the flusher and send the rest together with the final status change."""
@@ -324,21 +372,25 @@ class Streamer:
         text = self._take(final=True)
         if self.dropped:
             text = "[board: output was dropped while the board was unreachable]\n" + text
-        if not text and not final_kw:
-            return
+        chunks: list[tuple[str, str, dict]] = []
+        if self.inflight is not None:  # never merged with newer text: it keeps its id
+            chunks.append((*self.inflight, {}))
+        if text or final_kw:
+            chunks.append((new_request_id(), text, final_kw))
         deadline, delay, told = time.monotonic() + patience, 0.25, False
-        while True:
-            if self._send(text, **final_kw):
+        for rid, chunk, kw in chunks:
+            while not self._send(rid, chunk, **kw):
+                if time.monotonic() + delay > deadline:
+                    warn(f"giving up on posting the end of the output to {self.post_id}")
+                    return
+                if not told:
+                    warn(f"board unreachable; retrying for up to {int(patience)}s to post the end of the output")
+                    told = True
+                time.sleep(delay)
+                delay = min(delay * 2, 5.0)
+            if self.dead:
                 return
-            text = self._take(final=True)
-            if time.monotonic() + delay > deadline:
-                break
-            if not told:
-                warn(f"board unreachable; retrying for up to {int(patience)}s to post the end of the output")
-                told = True
-            time.sleep(delay)
-            delay = min(delay * 2, 5.0)
-        warn(f"giving up on posting the end of the output to {self.post_id}")
+            self.inflight = None
 
 
 def pump(fd: int, streamer: Streamer) -> None:
@@ -546,6 +598,105 @@ def append_cmd(
     emit(res, as_json, quiet)
 
 
+# ---------------------------------------------------------------- ask / wait
+
+
+TimeoutOpt = Annotated[Optional[float], typer.Option("--timeout", min=0)]
+
+
+def print_reply(post: dict, as_json: bool) -> None:
+    rep = post["payload"]["reply"]
+    if as_json:
+        out(dumps({"id": post["id"], **rep}))
+        return
+    out(rep["action"])
+    if rep.get("text"):
+        out(rep["text"].rstrip("\n"))
+
+
+def wait_for_reply(be, post_id: str, timeout: float | None, as_json: bool, post: dict | None = None) -> None:
+    """Poll until the post has a reply, then print it. Direct mode reads the store every
+    0.5 s; BOARD_URL mode asks the server every 1 s and keeps waiting while it is down."""
+    remote = isinstance(be, HttpBackend)
+    interval = WAIT_POLL_HTTP if remote else WAIT_POLL_LOCAL
+    deadline = None if timeout is None else time.monotonic() + timeout
+    warned = False
+    first = post is None
+    try:
+        while True:
+            if post is None:
+                try:
+                    post = be.get_post(post_id)
+                except Unreachable as e:
+                    if not warned:
+                        warn(f"{e} Still waiting for the reply on {post_id}.")
+                        warned = True
+                except BoardError as e:
+                    if e.status < 500:
+                        raise
+                    if not warned:
+                        warn(f"{e.message}; still waiting for the reply on {post_id}")
+                        warned = True
+                except Exception as e:  # e.g. sqlite busy: try again on the next poll
+                    if not warned:
+                        warn(f"cannot read {post_id} ({e}); still waiting")
+                        warned = True
+            if post is not None:
+                if post["payload"].get("reply"):
+                    print_reply(post, as_json)
+                    return
+                if post["status"] != "blocked":
+                    if first:
+                        raise BoardError("post is not waiting for input")
+                    raise BoardError(f"post {post_id} is no longer waiting for input "
+                                     f"(status changed to {post['status']} without a reply)")
+                first = False
+                post = None
+            if deadline is not None and time.monotonic() >= deadline:
+                warn(f"no reply yet on {post_id}; the question stays open. "
+                     f"Run 'board wait {post_id}' later to get the answer.")
+                raise typer.Exit(EXIT_TIMEOUT)
+            pause = interval if deadline is None else max(0.0, min(interval, deadline - time.monotonic()))
+            time.sleep(pause)
+    except KeyboardInterrupt:
+        warn(f"stopped waiting; the question stays open. Run 'board wait {post_id}' to resume.")
+        raise typer.Exit(130)
+
+
+@app.command("ask")
+def ask_cmd(
+    question: Annotated[Optional[str], typer.Argument()] = None,
+    agent: AgentOpt = None,
+    title: TitleOpt = None,
+    key: KeyOpt = None,
+    timeout: TimeoutOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    if question is None:
+        raise InputError('give the question: board ask -a NAME "Can I delete the users table?"')
+    a = agent_name(agent)
+    text = read_value(question)
+    if not text.strip():
+        raise InputError("the question is empty")
+    be = backend()
+    post, _ = be.create_post(agent=a, kind="text", payload={"text": text, "ask": True}, title=title,
+                             status="blocked", key=key)
+    pid = post["id"]
+    warn(f"waiting for the human on {pid} (board wait {pid} to resume)")
+    wait_for_reply(be, pid, timeout, as_json, post=post)
+
+
+@app.command("wait")
+def wait_cmd(
+    post_id: Annotated[Optional[str], typer.Argument(metavar="ID")] = None,
+    timeout: TimeoutOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    if not post_id:
+        raise InputError("give the post ID: board wait ID")
+    wait_for_reply(backend(), post_id, timeout, as_json)
+
+
 @app.command("ls")
 def ls_cmd(
     agent: AgentOpt = None,
@@ -636,6 +787,7 @@ VALUE_OPTS = {
     "post": {"-a", "--agent", "-t", "--title", "-s", "--status", "-k", "--key",
              "--md", "--markdown", "--table", "--chart", "--image", "--text"},
     "append": {"-s", "--status", "-t", "--title"},
+    "ask": {"-a", "--agent", "-t", "--title", "-k", "--key", "--timeout"},
 }
 _OPTION_LIKE = re.compile(r"^--?[A-Za-z][A-Za-z0-9-]*(=.*)?$")
 

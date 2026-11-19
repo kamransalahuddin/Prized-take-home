@@ -52,6 +52,17 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
 - `append ID [TEXT] [-s S] [-t T] [--json] [-q]`: TEXT literal / `-` / `@path`;
   one-off literal → `store.append(id, text, newline=True)`; `-` streams like log pipe mode.
   No TEXT and no -s/-t → exit 2.
+- `ask -a NAME [-t T] [-k K] [--timeout SECONDS] [--json] QUESTION` (QUESTION: value rule):
+  creates a `text` post, status `blocked`, `payload.ask = true`; stderr
+  `board: waiting for the human on ID (board wait ID to resume)`; then waits like `wait`.
+- `wait ID [--timeout SECONDS] [--json]`: waits until the post has `payload.reply`, then
+  stdout line 1 = `approve` | `reject` | `answer`, then the reply text (if any) on the next
+  lines (`--json`: one line `{"id","action","text","at"}`); exit 0. Already replied →
+  prints at once. Not blocked and no reply → exit 1 `post is not waiting for input`
+  (also if it stops being blocked without a reply while waiting). Polls the store every
+  0.5 s, or with `BOARD_URL` `GET /api/posts/{id}` every 1 s, warning once and waiting on
+  while the server is down. `--timeout` (default: forever) → exit 4, the question stays
+  open. Ctrl-C → exit 130.
 - `ls [-a NAME] [-n 20] [--json]`: `store.list_posts(agent, limit, with_payload=False)`;
   TSV lines `ID\tAGENT\tKIND\tSTATUS\tTITLE` (title fallback: first 60 chars of text, else `-`).
 - `serve [--port 8000] [--host 127.0.0.1] [--data DIR]`: if port already serves a board
@@ -61,7 +72,11 @@ See `board/help.py` for the user-facing text (verbatim; must stay ≤80 cols, �
   `timeout_graceful_shutdown=2`, one worker.
 - stdout: post ID + `\n` (or one-line JSON with `--json`). Everything else → stderr.
 - Exit codes: 0 ok · 1 rejected (`BoardError`, HTTP 4xx/5xx) · 2 usage/input · 3 `BOARD_URL`
-  unreachable · `log -- CMD` → CMD's code.
+  unreachable · 4 `ask`/`wait` timed out with no reply · `log -- CMD` → CMD's code.
+- Idempotent writes: the CLI sends a fresh uuid4 `request_id` with every logical write
+  (post, append, each streamed log chunk, reply, asset) and reuses it on every retry of
+  that write. A chunk being retried keeps its exact text; newer output goes in a later
+  chunk. Over HTTP, one-shot writes retry transport errors up to 3 times.
 
 ## 3. Data model
 
@@ -85,18 +100,35 @@ Post object (from `store.get_post` / `list_posts`, in API responses and `post` e
 
 `seq` = id of the last event that touched the post. Global, monotonic.
 
+Human replies (any non-log kind, normally `text`):
+- `payload.ask = true` — made by `board ask` (the page shows the reply buttons;
+  a post made with `-s blocked` without it can be answered too).
+- `payload.reply = {"action": "approve"|"reject"|"answer", "text": str|null,
+  "at": "2026-11-18T16:45:12.345Z"}` — set once by `POST /api/posts/{id}/reply`
+  (`Store.reply`); the same write sets status `blocked` → `info`. A `--key` replace
+  replaces the payload, so it clears the reply (re-asking with the same key works).
+
+Idempotency: table `requests(id, result, created_at)`. `create_post`, `append`, `reply`
+and `add_asset` take an optional `request_id`; in the same transaction, a known id returns
+the stored result without writing (an id reused for a different operation → 409). Rows
+older than 1 day are pruned on write.
+
 ## 4. HTTP API (server.py; thin wrapper over Store; errors → `{"error": msg}` with `BoardError.status`)
 
 | Method/path | Body → Response |
 |---|---|
-| `POST /api/posts` | `{"agent","kind","payload","title"?,"status"?,"key"?,"live"?}` → 201 post+`"created":true` / 200 on key replace (`"created":false`). Body limit 8 MB (413). |
-| `POST /api/posts/{id}/append` | `{"text"?,"status"?,"title"?,"done"?,"exit_code"?,"newline"?}` → 200 `{"id","seq","status","title","live","updated_at","size"}`; 404 / 409 |
-| `POST /api/assets` | multipart field `file` → 201 `{"id","mime","size","url"}`; 415 / 413 |
+| `POST /api/posts` | `{"agent","kind","payload","title"?,"status"?,"key"?,"live"?,"request_id"?}` → 201 post+`"created":true` / 200 on key replace (`"created":false`). Body limit 8 MB (413). |
+| `POST /api/posts/{id}/append` | `{"text"?,"status"?,"title"?,"done"?,"exit_code"?,"newline"?,"request_id"?}` → 200 `{"id","seq","status","title","live","updated_at","size"}`; 404 / 409 |
+| `POST /api/posts/{id}/reply` | `{"action":"approve"\|"reject"\|"answer","text"?,"request_id"?}` (`answer` needs non-empty text; text ≤ 10000 chars) → 200 full post (`payload.reply` set, status `info`, emits `post`); 400 bad action/text · 404 · 409 `{"error":"already answered"}` / `{"error":"post is not waiting for input"}` (status not `blocked`) |
+| `POST /api/assets` | multipart field `file` (+ optional form field `request_id` or header `X-Request-Id`) → 201 `{"id","mime","size","url"}`; 415 / 413 |
 | `GET /api/posts?agent=&limit=200` | → `{"posts":[...], "seq": N}` (N consistent with posts) |
 | `GET /api/posts/{id}` | → post |
 | `GET /api/assets/{id}` | bytes, stored MIME, `Cache-Control: public, max-age=31536000, immutable`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox` |
 | `GET /api/events` | SSE, see §5 |
 | `GET /` | `board/static/index.html`; `/static/*` serves `board/static/` (incl. `vendor/`) |
+
+`request_id` (optional string ≤ 200 chars) on any write makes it idempotent: repeating the
+same request returns the first response's body and writes nothing (see §3).
 
 ## 5. SSE wire format (`GET /api/events`)
 
