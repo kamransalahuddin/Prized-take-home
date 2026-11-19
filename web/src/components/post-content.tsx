@@ -77,7 +77,12 @@ export function PostContent({ post }: { post: Post }) {
       return <Chart post={post} />
     case "image":
       return (
-        <a href={data.url} target="_blank" rel="noreferrer">
+        <a
+          className="post-image-link"
+          href={data.url}
+          target="_blank"
+          rel="noreferrer"
+        >
           <img
             className="post-image"
             loading="lazy"

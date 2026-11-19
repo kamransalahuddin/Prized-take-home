@@ -1,0 +1,11 @@
+{
+  "name": "board-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node media.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.65.1"
+  }
+}

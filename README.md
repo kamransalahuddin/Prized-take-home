@@ -52,6 +52,9 @@ Icons: Solar by 480 Design (CC BY 4.0); agent portraits: Uicons by Flaticon.
 ## Tests
 
 `pip install '.[dev]' && pytest` (245 tests) · `cd web && npm i && npm test`.
+Browser check that every image format and chart actually shows on the page (needs Chrome, or
+`npx playwright-core install chromium`; `ENGINE=webkit|firefox` also work):
+`cd web && npm run build && cd ../tests/e2e && npm i && PYTHON=python3 node media.mjs`.
 Beyond unit tests, independent agents tried to break it in three rounds (hostile input,
 kill -9 under load, disk full, chaos proxies, signals); every finding was fixed with a
 regression test. A fresh Claude Code agent with subagents used it on real repos knowing only
