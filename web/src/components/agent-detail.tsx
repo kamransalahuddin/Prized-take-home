@@ -6,7 +6,7 @@ import { TweetCard } from "./magicui/tweet-card"
 import { Icon } from "./icon"
 import { StatusLabel } from "./status-label"
 import { PostContent } from "./post-content"
-import { avatarFor, displayName, roleLabel } from "@/lib/agents"
+import { avatarFor, compareNewest, displayName, isQuestion, roleLabel } from "@/lib/agents"
 import type { AgentNode, Post } from "@/lib/types"
 import { applyLocalPost } from "@/lib/board"
 import { nextAttempt, replyBody, sendReply, type ReplyAction, type ReplyAttempt } from "@/lib/reply"
@@ -136,16 +136,22 @@ function From({ id }: { id: string }) {
     </p>
   )
 }
+/** Every post of an agent and its subagents, newest first. */
+function treePosts(agent: AgentNode): Post[] {
+  return [agent.posts, ...agent.children.map(treePosts)].flat().sort(compareNewest)
+}
+/** How many updates the page shows; the rest are on each subagent's own page. */
+const MAX_UPDATES = 60
 export function AgentDetail({ agent }: { agent: AgentNode }) {
+  const all = treePosts(agent)
   // Every open question (blocked, unanswered, any kind) gets its own Approve/Reject, so the
   // "Needs input" label always comes with a way to answer (agents.ts decides both).
   const questions = agent.questions
-  const open = new Set(questions.map((q) => q.id))
-  // Keep the pending decisions above the most recent separate update. A parent that never
-  // posted shows the subagent post behind its "Requires attention".
-  const update =
-    agent.posts.find((p) => !open.has(p.id)) ??
-    (agent.state === "attention" ? agent.cause : null)
+  // Below the decisions: what the agent and its subagents posted (charts, images, tables,
+  // logs, ...), newest first. A subagent's open question is answered on its own page.
+  const updates = all.filter((p) => !isQuestion(p)).slice(0, MAX_UPDATES)
+  // A parent that never posted shows the post behind its label.
+  if (!updates.length && agent.state === "attention" && agent.cause) updates.push(agent.cause)
   return (
     <main className="workspace detail">
       <span aria-hidden="true" className="large-avatar">
@@ -188,28 +194,30 @@ export function AgentDetail({ agent }: { agent: AgentNode }) {
           </Fragment>
         )
       })}
-      {update && update.agent !== agent.id && <From id={update.agent} />}
-      {update && (
-        <TweetCard className="update" key={update.id}>
-          <CardTitle title={update.title} revealed={!!update.payload.reply} />
-          <PostContent post={update} />
-          {update.payload.reply && (
-            <p className="response">
-              <strong>
-                {
+      {updates.map((update) => (
+        <Fragment key={update.id}>
+          {update.agent !== agent.id && <From id={update.agent} />}
+          <TweetCard className="update">
+            <CardTitle title={update.title} revealed={!!update.payload.reply} />
+            <PostContent post={update} />
+            {update.payload.reply && (
+              <p className="response">
+                <strong>
                   {
-                    approve: "Approved",
-                    reject: "Rejected",
-                    answer: "Answered",
-                  }[String(update.payload.reply.action)]
-                }
-              </strong>{" "}
-              {update.payload.reply.text}
-            </p>
-          )}
-        </TweetCard>
-      )}
-      {!agent.posts.length && !questions.length && !update && <p className="byline">No updates yet.</p>}
+                    {
+                      approve: "Approved",
+                      reject: "Rejected",
+                      answer: "Answered",
+                    }[String(update.payload.reply.action)]
+                  }
+                </strong>{" "}
+                {update.payload.reply.text}
+              </p>
+            )}
+          </TweetCard>
+        </Fragment>
+      ))}
+      {!questions.length && !updates.length && <p className="byline">No updates yet.</p>}
       {!!agent.children.length && (
         <nav className="sub-links" aria-label="Subagents">
           {agent.children.map((c) => (

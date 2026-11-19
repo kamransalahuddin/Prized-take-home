@@ -660,6 +660,14 @@
 .sub-links {
   margin-top: 22px;
 }
+/* A subagent label belongs to the card below it, not the one above. */
+.byline.from {
+  margin: 28px 0 0;
+}
+.byline.from + .update,
+.byline.from + .decision {
+  margin-top: 8px;
+}
 .sub-links a,
 .from a {
   display: inline-flex;

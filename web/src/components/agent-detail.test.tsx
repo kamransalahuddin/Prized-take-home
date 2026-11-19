@@ -56,16 +56,36 @@ describe("AgentDetail decision vs update card", () => {
   })
 
   it("an answered question leaves the decision area and its title shows already revealed", () => {
-    const { inner } = rendered([
+    const { top, inner } = rendered([
       post("p_old", 1),
       post("p_q", 3, { ...table, payload: { ...table.payload, reply: { action: "approve", text: null, at: "x" } } }),
     ])
     expect(inner.some((e) => classOf(e) === "decision")).toBe(false)
-    const card = inner.find((e) => classOf(e).includes("update"))
-    expect(card?.key).toBe("p_q")
+    const slot = top.find((e) => e.key === "p_q")!
+    const card = ([(slot.props as { children: ReactNode[] }).children].flat(2).filter(isValidElement) as ReactElement[])
+      .find((e) => classOf(e).includes("update"))
+    expect(card).toBeDefined()
     const title = ([(card!.props as { children: ReactNode[] }).children].flat(2) as ReactElement[]).find(
       (c) => isValidElement(c) && (c.props as { revealed?: boolean }).revealed !== undefined,
     )
     expect((title!.props as { revealed: boolean }).revealed).toBe(true)
+  })
+})
+
+describe("AgentDetail shows what the agent and its subagents posted", () => {
+  it("a parent's page lists its subagents' charts and images, newest first", () => {
+    const posts = [
+      post("p_start", 1),
+      post("p_chart", 2, { agent: "lead/charts", kind: "chart", payload: { option: { series: [] } } }),
+      post("p_img", 3, { agent: "lead/charts", kind: "image", payload: { url: "/api/assets/a_x", mime: "image/png" } }),
+      post("p_done", 4, { status: "ok" }),
+    ]
+    const { top } = rendered(posts)
+    expect(top.map((e) => e.key).filter((k) => k?.startsWith("p_"))).toEqual(["p_done", "p_img", "p_chart", "p_start"])
+  })
+
+  it("a subagent's open question is not shown as a plain card on the parent", () => {
+    const { top } = rendered([post("p_start", 1), post("p_q", 2, { agent: "lead/x", status: "blocked" })])
+    expect(top.some((e) => e.key === "p_q")).toBe(false)
   })
 })
